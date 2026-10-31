@@ -44,7 +44,7 @@ asyncpg>=0.29.0
 
 # LLM Testing (AI/LLM evaluation)
 deepeval>=2.0.0
-tiktoken>=0.7.0
+tiktoken>=0.14.0
 
 # Scheduling (Cron-based regression runs)
 APScheduler>=3.10.0
