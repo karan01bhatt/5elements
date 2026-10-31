@@ -53,6 +53,8 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-code": "2.1.177",
+    "@neon/config": "^1.10.0",
+    "@neon/env": "^1.6.8",
     "@playwright/mcp": "0.0.76",
     "playwright": "1.61.0",
     "playwright-core": "1.61.0",

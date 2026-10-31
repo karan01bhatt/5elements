@@ -130,6 +130,7 @@ def upgrade() -> None:
         "testrun",
         sa.Column("id", sa.String(), nullable=False),
         sa.Column("spec_name", sa.String(), nullable=False),
+        sa.Column("test_type", sa.String(), nullable=True, server_default="browser"),
         sa.Column("status", sa.String(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=True),
         sa.Column("test_name", sa.String(), nullable=True),

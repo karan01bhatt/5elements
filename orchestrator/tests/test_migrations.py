@@ -19,6 +19,56 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 class TestDatabaseInit:
     """Test that init_db() works correctly on a fresh database."""
 
+    def test_pooled_postgres_engine_uses_pooler_compatible_options(self, monkeypatch):
+        import orchestrator.api.db as db_module
+
+        engine_options = {}
+
+        def capture_engine_options(url, **options):
+            engine_options.update(options)
+            return object()
+
+        monkeypatch.setattr(
+            db_module,
+            "DATABASE_URL",
+            "postgresql://user:password@example-pooler.region.aws.neon.tech/neondb",
+        )
+        monkeypatch.setattr(db_module, "create_engine", capture_engine_options)
+
+        db_module._create_engine()
+
+        assert engine_options["connect_args"] == {}
+        assert engine_options["pool_size"] == 5
+        assert engine_options["max_overflow"] == 5
+
+    def test_direct_postgres_engine_keeps_statement_timeout(self, monkeypatch):
+        import orchestrator.api.db as db_module
+
+        engine_options = {}
+
+        def capture_engine_options(url, **options):
+            engine_options.update(options)
+            return object()
+
+        monkeypatch.setattr(
+            db_module,
+            "DATABASE_URL",
+            "postgresql://user:password@example.region.aws.neon.tech/neondb",
+        )
+        monkeypatch.setattr(db_module, "create_engine", capture_engine_options)
+
+        db_module._create_engine()
+
+        assert engine_options["connect_args"] == {"options": "-c statement_timeout=30000"}
+        assert engine_options["pool_size"] == 30
+        assert engine_options["max_overflow"] == 60
+
+    def test_initial_testrun_schema_has_type_before_index_migration(self):
+        migration = Path(__file__).parent.parent / "migrations" / "versions" / "001_initial_schema.py"
+        migration_text = migration.read_text(encoding="utf-8")
+
+        assert 'sa.Column("test_type", sa.String(), nullable=True, server_default="browser")' in migration_text
+
     def test_alembic_revision_ids_are_unique_and_ordered(self):
         versions_dir = Path(__file__).parent.parent / "migrations" / "versions"
         revisions: dict[str, list[Path]] = {}

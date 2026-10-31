@@ -12,7 +12,11 @@ async def _log_startup_diagnostics(runtime: Any) -> None:
     db_type = runtime.get_database_type()
     diagnostics.append(f"Database: {db_type}")
     if db_type == "postgresql":
-        diagnostics.append("  Pool: size=30, max_overflow=60, timeout=30s, statement_timeout=30s")
+        database_url = runtime.os.environ.get("DATABASE_URL", "").lower()
+        if "-pooler." in database_url:
+            diagnostics.append("  Pool: size=5, max_overflow=5, timeout=30s (pooled PostgreSQL)")
+        else:
+            diagnostics.append("  Pool: size=30, max_overflow=60, timeout=30s, statement_timeout=30s")
 
     redis_status = "unavailable"
     try:

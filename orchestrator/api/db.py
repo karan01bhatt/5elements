@@ -4,6 +4,7 @@ import time
 from collections.abc import Generator
 from pathlib import Path
 
+from sqlalchemy.engine import make_url
 from sqlmodel import Session, SQLModel, create_engine
 
 from orchestrator.config import settings as app_settings
@@ -167,19 +168,21 @@ def _create_engine():
             },
         )
     else:
-        # PostgreSQL with connection pooling for concurrent access
-        # Pool sized for 5-10 concurrent tests (10 tests × 6 sessions each = 60 connections)
+        database_host = (make_url(DATABASE_URL).host or "").lower()
+        is_pooled_connection = "-pooler." in database_host
+        connect_args = {}
+        if not is_pooled_connection:
+            connect_args["options"] = "-c statement_timeout=30000"
+
         return create_engine(
             DATABASE_URL,
             echo=False,
-            pool_size=30,  # Base connections for concurrent tests
-            max_overflow=60,  # Burst capacity for peak load
+            pool_size=5 if is_pooled_connection else 30,
+            max_overflow=5 if is_pooled_connection else 60,
             pool_pre_ping=True,
             pool_recycle=300,  # Recycle connections every 5 minutes
             pool_timeout=30,  # Explicit timeout to fail fast on exhaustion
-            connect_args={
-                "options": "-c statement_timeout=30000"  # Kill queries running >30s
-            },
+            connect_args=connect_args,
         )
 
 
