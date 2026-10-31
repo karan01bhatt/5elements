@@ -1,0 +1,2831 @@
+"""
+App Explorer Workflow - AI-Powered Application Discovery
+
+This workflow uses an AI agent with Playwright MCP tools to autonomously
+explore a web application, discovering:
+- Pages and their structure
+- User flows (multi-step interactions)
+- API endpoints
+- Form behaviors
+- Error states
+
+The exploration data is stored in the database and can be used for:
+- Requirements generation
+- RTM (Requirements Traceability Matrix) creation
+- Test coverage analysis
+"""
+
+import asyncio
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+# Add both project root and orchestrator package dir for package and standalone execution.
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Load Claude credentials and SDK
+from load_env import setup_claude_env
+
+setup_claude_env()
+
+import logging
+
+from orchestrator.ai.context import SOURCE_OBSERVED
+from orchestrator.ai.prompt_registry import (
+    attach_prompt_metadata,
+    build_prompt_metadata,
+)
+from orchestrator.ai.validation import (
+    assess_exploration_quality,
+    validate_exploration_result,
+)
+from utils.agent_runner import AgentRunner, get_default_timeout
+from utils.agent_tool_allowlists import get_agent_allowed_tools
+from utils.claude_config import copy_claude_project_config
+from utils.json_utils import extract_json_from_markdown
+from utils.playwright_mcp import (
+    build_playwright_mcp_server_config,
+    is_package_version_at_least,
+    write_playwright_mcp_config,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExplorationConfig:
+    """Configuration for app exploration."""
+
+    entry_url: str
+    max_interactions: int = 50  # Maximum interactions before stopping
+    max_depth: int = 10  # Maximum navigation depth from entry
+    strategy: str = "goal_directed"  # goal_directed, breadth_first, depth_first
+    timeout_minutes: int = 30  # Maximum exploration time
+    credentials: dict[str, str] | None = None  # Login credentials if needed
+    login_url: str | None = None  # Login page URL
+    exclude_patterns: list[str] = field(default_factory=list)  # URL patterns to skip
+    focus_areas: list[str] = field(default_factory=list)  # Areas to prioritize
+    additional_instructions: str | None = None  # Custom instructions for AI
+    model_tier: str = "tool_deep"
+    storage_state_path: str | None = None
+    browser_auth_context: dict[str, Any] | None = None
+
+
+@dataclass
+class TransitionRecord:
+    """Record of a single state transition during exploration."""
+
+    sequence: int
+    action_type: str
+    action_element: dict[str, Any]
+    action_value: str | None
+    before_url: str
+    before_page_type: str | None
+    before_elements: list[str]
+    after_url: str
+    after_page_type: str | None
+    after_elements: list[str]
+    transition_type: (
+        str  # navigation, modal_open, modal_close, inline_update, error, no_change
+    )
+    api_calls: list[dict[str, Any]]
+    changes_description: str | None = None
+
+
+@dataclass
+class FlowRecord:
+    """Record of a discovered user flow."""
+
+    name: str
+    category: str  # authentication, crud, navigation, form_submission, search
+    steps: list[dict[str, Any]]
+    start_url: str
+    end_url: str
+    outcome: str
+    is_success_path: bool = True
+    preconditions: list[str] = field(default_factory=list)
+    postconditions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class IssueRecord:
+    """Record of a discovered issue during exploration."""
+
+    issue_type: str  # broken_link, error_page, accessibility, performance, usability, security, missing_content
+    severity: str  # critical, high, medium, low
+    url: str
+    description: str
+    element: str | None = None
+    evidence: str | None = None
+
+
+@dataclass
+class PageRecord:
+    """Record of an observed page/state during exploration."""
+
+    url: str
+    title: str | None = None
+    page_type: str | None = None
+    purpose: str | None = None
+    key_elements: list[str] = field(default_factory=list)
+    forms: list[dict[str, Any]] = field(default_factory=list)
+    actions: list[str] = field(default_factory=list)
+    links: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ExplorationResult:
+    """Result of an exploration session."""
+
+    session_id: str
+    entry_url: str
+    status: str  # completed, failed, timeout, stopped
+    transitions: list[TransitionRecord] = field(default_factory=list)
+    flows: list[FlowRecord] = field(default_factory=list)
+    pages: list[PageRecord] = field(default_factory=list)
+    api_endpoints: list[dict[str, Any]] = field(default_factory=list)
+    issues: list[IssueRecord] = field(default_factory=list)
+    pages_discovered: int = 0
+    elements_discovered: int = 0
+    error_message: str | None = None
+    duration_seconds: int = 0
+    provenance_source: str = SOURCE_OBSERVED
+    quality_score: int = 0
+    quality_summary: dict[str, Any] = field(default_factory=dict)
+    validation_summary: dict[str, Any] = field(default_factory=dict)
+    prompt_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class AppExplorer:
+    """
+    AI-Powered Application Explorer.
+
+    Uses a Claude agent with Playwright MCP tools to autonomously
+    explore web applications and discover their structure and behavior.
+    """
+
+    def __init__(
+        self,
+        project_id: str = "default",
+        on_task_enqueued=None,
+        on_progress=None,
+        on_tool_use=None,
+        owner_type: str | None = None,
+        owner_id: str | None = None,
+        owner_label: str | None = None,
+    ):
+        self.project_id = project_id
+        self.on_task_enqueued = on_task_enqueued
+        self.on_progress = on_progress
+        self.on_tool_use = on_tool_use
+        self.owner_type = owner_type
+        self.owner_id = owner_id
+        self.owner_label = owner_label
+        self.output_dir = self._ensure_output_dir()
+        self._last_prompt_metadata: dict[str, Any] = {}
+        self._last_agent_stats: dict[str, Any] = {}
+
+    def _ensure_output_dir(self) -> Path:
+        """Ensure output directory exists with fallback paths.
+
+        Tries multiple candidate paths to handle both local development
+        and Docker container environments.
+        """
+        # Calculate project root from this file's location
+        project_root = Path(__file__).resolve().parent.parent.parent
+
+        candidates = [
+            project_root / "runs" / "explorations",  # Primary: project-relative path
+            Path("/app/runs/explorations"),  # Docker path
+            Path.cwd() / "runs" / "explorations",  # Fallback: cwd-relative
+        ]
+
+        for path in candidates:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                # Verify we can write to this directory
+                test_file = path / ".write_test"
+                test_file.write_text("test")
+                test_file.unlink()
+                logger.info(f"Using output directory: {path}")
+                return path
+            except (PermissionError, OSError) as e:
+                logger.warning(f"Cannot use {path}: {e}")
+                continue
+
+        # Last resort: use temp directory
+        import tempfile
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="explorations_"))
+        logger.warning(f"Using temporary directory: {temp_dir}")
+        return temp_dir
+
+    async def explore(
+        self, config: ExplorationConfig, session_id: str | None = None
+    ) -> ExplorationResult:
+        """
+        Start an exploration session.
+
+        Args:
+            config: Exploration configuration
+            session_id: Optional session ID (auto-generated if not provided)
+
+        Returns:
+            ExplorationResult with all discovered data
+        """
+        if session_id is None:
+            session_id = f"explore_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+
+        # Create output directory for this session
+        session_dir = self.output_dir / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info("=" * 80)
+        logger.info("AI-POWERED APP EXPLORATION")
+        logger.info("=" * 80)
+        logger.info(f"   Session: {session_id}")
+        logger.info(f"   Entry URL: {config.entry_url}")
+        logger.info(f"   Strategy: {config.strategy}")
+        logger.info(f"   Max Interactions: {config.max_interactions}")
+        logger.info(f"   Max Depth: {config.max_depth}")
+        if config.credentials:
+            logger.info("   Authentication: Enabled")
+        if config.storage_state_path:
+            logger.info("   Saved browser auth: Enabled")
+        logger.info("")
+
+        # Save config
+        config_data = {
+            "entry_url": config.entry_url,
+            "max_interactions": config.max_interactions,
+            "max_depth": config.max_depth,
+            "strategy": config.strategy,
+            "timeout_minutes": config.timeout_minutes,
+            "has_credentials": bool(config.credentials),
+            "login_url": config.login_url,
+            "exclude_patterns": config.exclude_patterns,
+            "focus_areas": config.focus_areas,
+            "has_saved_browser_auth": bool(config.storage_state_path),
+        }
+        (session_dir / "config.json").write_text(json.dumps(config_data, indent=2))
+
+        start_time = datetime.now()
+
+        try:
+            # Build the exploration prompt
+            prompt = self._build_exploration_prompt(config)
+            if self._last_prompt_metadata:
+                (session_dir / "prompt_metadata.json").write_text(
+                    json.dumps(self._last_prompt_metadata, indent=2)
+                )
+
+            # Invoke the explorer agent
+            logger.info("Starting AI Explorer Agent...")
+
+            raw_output = await self._run_explorer_agent(prompt, session_dir, config)
+
+            # Log output diagnostics
+            output_len = len(raw_output) if raw_output else 0
+            if output_len == 0:
+                logger.error("Explorer agent returned empty output")
+            elif output_len < 200:
+                logger.warning(
+                    f"Explorer agent returned very short output ({output_len} chars): {raw_output[:200]}"
+                )
+            else:
+                logger.info(f"   Agent output: {output_len} chars")
+
+            # Parse the exploration output
+            logger.info("Processing exploration results...")
+
+            successful_browser_tool_calls = int(
+                self._last_agent_stats.get("successful_browser_tool_calls", 0) or 0
+            )
+            artifact_browser_evidence = self._count_browser_artifact_evidence(session_dir)
+            if successful_browser_tool_calls <= 0:
+                if artifact_browser_evidence <= 0:
+                    raise RuntimeError(
+                        "Explorer did not perform successful live browser exploration. "
+                        "Check Playwright MCP startup, allowed tools, and agent configuration."
+                    )
+                logger.warning(
+                    "Explorer tool telemetry was empty, but %s browser artifact(s) were captured; "
+                    "using artifact evidence for verification.",
+                    artifact_browser_evidence,
+                )
+                successful_browser_tool_calls = artifact_browser_evidence
+                self._last_agent_stats["successful_browser_tool_calls"] = artifact_browser_evidence
+                self._last_agent_stats["browser_tool_calls"] = max(
+                    int(self._last_agent_stats.get("browser_tool_calls", 0) or 0),
+                    artifact_browser_evidence,
+                )
+                self._last_agent_stats["artifact_browser_evidence"] = artifact_browser_evidence
+
+            if self._is_unverified_agent_output(raw_output):
+                raise RuntimeError(
+                    "Explorer output says live browser tools were unavailable, so no verified exploration "
+                    "results can be used. Check Playwright MCP/agent configuration."
+                )
+
+            result = self._parse_exploration_output(
+                raw_output=raw_output, session_id=session_id, entry_url=config.entry_url
+            )
+
+            if (
+                result.status == "failed"
+                and not result.transitions
+                and not result.flows
+                and not result.pages
+                and not result.api_endpoints
+            ):
+                logger.info(
+                    "   No structured exploration data parsed — attempting AI-powered recovery..."
+                )
+                recovered_objects = await self._run_ai_json_recovery(
+                    raw_output, session_dir
+                )
+                if recovered_objects:
+                    result = self._parse_exploration_output(
+                        raw_output=raw_output,
+                        session_id=session_id,
+                        entry_url=config.entry_url,
+                        pre_extracted_json=recovered_objects,
+                    )
+                    if result.transitions or result.flows:
+                        logger.info(
+                            f"   AI recovery successful: {len(result.transitions)} transitions, "
+                            f"{len(result.flows)} flows"
+                        )
+
+            # Run synthesis when flow density is weak relative to observed evidence.
+            min_expected = self._minimum_expected_flows(result)
+            if (result.transitions or result.pages) and len(
+                result.flows
+            ) < min_expected:
+                logger.info(
+                    f"   Running AI flow synthesis pass "
+                    f"({len(result.flows)} flows from {len(result.transitions)} transitions, "
+                    f"{len(result.pages)} pages)..."
+                )
+                synthesized = await self._run_flow_synthesis_pass(
+                    result.transitions,
+                    result.flows,
+                    result.pages,
+                    session_dir,
+                    min_expected=min_expected,
+                )
+                if len(result.flows) + len(synthesized) < min_expected:
+                    synthesized.extend(
+                        self._synthesize_flows_from_pages(
+                            result.pages,
+                            result.flows + synthesized,
+                            limit=min_expected - len(result.flows) - len(synthesized),
+                        )
+                    )
+                if synthesized:
+                    # Deduplicate against existing flows
+                    existing_keys = {
+                        (
+                            f.name.replace(" (inferred)", "")
+                            .replace(" (synthesized)", "")
+                            .strip()
+                            .lower(),
+                            f.start_url.strip().rstrip("/").lower(),
+                            f.end_url.strip().rstrip("/").lower(),
+                        )
+                        for f in result.flows
+                    }
+                    new_flows = []
+                    for sf in synthesized:
+                        key = (
+                            sf.name.replace(" (synthesized)", "").strip().lower(),
+                            sf.start_url.strip().rstrip("/").lower(),
+                            sf.end_url.strip().rstrip("/").lower(),
+                        )
+                        if key not in existing_keys:
+                            new_flows.append(sf)
+                            existing_keys.add(key)
+                    if new_flows:
+                        logger.info(f"   Synthesized {len(new_flows)} additional flows")
+                        result.flows.extend(new_flows)
+
+            # Text-based flow synthesis from verified live-browser output.
+            # This is only reached after successful browser tool calls above.
+            if (
+                len(result.flows) == 0
+                and len(result.transitions) == 0
+                and raw_output
+                and len(raw_output) > 2000
+            ):
+                logger.info(
+                    "   No structured transitions found — attempting text-based flow synthesis from raw output..."
+                )
+                text_flows = await self._run_text_flow_synthesis(
+                    raw_output, session_dir
+                )
+                if text_flows:
+                    logger.info(f"   Text synthesis produced {len(text_flows)} flows")
+                    result.flows.extend(text_flows)
+
+                    # Fix status: text synthesis recovered usable data
+                    if result.status == "failed" and text_flows:
+                        result.status = "completed"
+                        result.error_message = f"No structured JSON parsed, but text synthesis recovered {len(text_flows)} flows."
+
+            if (
+                result.status == "failed"
+                and not result.transitions
+                and not result.flows
+                and not result.pages
+                and not result.api_endpoints
+            ):
+                raise RuntimeError(
+                    result.error_message
+                    or "Explorer produced no structured transitions or flows from live browser exploration."
+                )
+
+            if (
+                self._last_agent_stats.get("budget_stopped")
+                and result.status == "completed"
+                and (
+                    result.transitions
+                    or result.flows
+                    or result.pages
+                    or result.api_endpoints
+                )
+            ):
+                result.status = "completed_partial"
+                result.error_message = (
+                    f"Stopped after browser tool budget "
+                    f"({self._last_agent_stats.get('successful_browser_tool_calls')}/"
+                    f"{self._last_agent_stats.get('max_browser_tool_calls')}); "
+                    "using collected exploration evidence."
+                )
+
+            validation_summary = validate_exploration_result(result)
+            quality_summary = assess_exploration_quality(
+                result,
+                fallback_used=False,
+                verified_tool_calls=successful_browser_tool_calls,
+            )
+            quality_summary.pop("fallback_used", None)
+            result.validation_summary = validation_summary
+            result.quality_summary = quality_summary
+            result.quality_score = int(quality_summary["quality_score"])
+            result.provenance_source = quality_summary["source_type"]
+            result.prompt_metadata = self._last_prompt_metadata
+
+            # Calculate duration
+            end_time = datetime.now()
+            result.duration_seconds = int((end_time - start_time).total_seconds())
+
+            # Save results
+            self._save_results(result, session_dir)
+
+            logger.info("Exploration Complete!")
+            logger.info(f"   Pages Discovered: {result.pages_discovered}")
+            logger.info(f"   Flows Discovered: {len(result.flows)}")
+            logger.info(f"   Transitions Recorded: {len(result.transitions)}")
+            logger.info(f"   API Endpoints Found: {len(result.api_endpoints)}")
+            logger.info(f"   Duration: {result.duration_seconds}s")
+            logger.info(f"   Results saved to: {session_dir}")
+
+            return result
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Exploration timed out after {config.timeout_minutes} minutes"
+            )
+            return ExplorationResult(
+                session_id=session_id,
+                entry_url=config.entry_url,
+                status="timeout",
+                error_message=f"Timeout after {config.timeout_minutes} minutes",
+            )
+        except Exception as e:
+            logger.error(f"Exploration failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return ExplorationResult(
+                session_id=session_id,
+                entry_url=config.entry_url,
+                status="failed",
+                error_message=str(e),
+            )
+
+    def _load_agent_prompt(self, agent_name: str) -> str | None:
+        """Load agent prompt from .claude/agents/{agent_name}.md, stripping YAML frontmatter."""
+        project_root = Path(__file__).resolve().parent.parent.parent
+        agent_file = project_root / ".claude" / "agents" / f"{agent_name}.md"
+        if not agent_file.exists():
+            logger.warning(f"Agent file not found: {agent_file}")
+            return None
+        content = agent_file.read_text()
+        # Strip YAML frontmatter (--- ... ---)
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end != -1:
+                content = content[end + 3 :].strip()
+        return content
+
+    def _build_rules_section(self, using_md_agent: bool) -> str:
+        """Build the Important Rules section, avoiding duplication when .md agent is loaded."""
+        if using_md_agent:
+            # The api-explorer.md already has comprehensive rules (12 rules).
+            # Only append credential placeholder rules not covered by the .md file.
+            return """## Additional Rules
+
+1. ALWAYS use actual credential values during browser interaction
+2. ALWAYS use placeholder syntax (e.g. {{LOGIN_USERNAME}}) in recorded output
+
+Begin exploration now!"""
+        else:
+            return """## Important Rules
+
+1. ALWAYS record transitions after each interaction
+2. ALWAYS output a flow JSON record when you complete a sequence of related actions
+3. ALWAYS use actual credential values during browser interaction
+4. ALWAYS use placeholder syntax in recorded output
+5. Do NOT re-output flow records in the final summary - only include counts
+6. NEVER click logout until you've fully explored authenticated areas
+7. NEVER execute truly destructive actions (delete all data, etc.)
+8. When a "Leave site?", unsaved changes, or beforeunload dialog appears, call `browser_handle_dialog` with `accept: true` immediately, then verify with `browser_snapshot` or `browser_take_screenshot`
+9. If stuck, try `browser_navigate_back` or return to entry URL
+
+Begin exploration now!"""
+
+    def _get_site_type_instructions(self, entry_url: str) -> str:
+        """Return site-type-specific instructions based on URL patterns."""
+        gov_patterns = [
+            ".gov",
+            ".gov.",
+            "government",
+            "portal",
+            "e-gov",
+            "citizen",
+            "mygov",
+        ]
+        if any(p in entry_url.lower() for p in gov_patterns):
+            return """
+## Government Portal Instructions
+This appears to be a government portal. Apply these specific rules:
+1. Expect slow page loads (5-15 seconds). ALWAYS use `browser_wait_for(time: 5)` after navigation.
+2. Dismiss any language selector immediately by selecting the primary language.
+3. Accept all cookie/consent banners on first encounter.
+4. Use `browser_hover` on visible top-level menu items that look likely to reveal major app areas.
+5. Use `browser_evaluate` to extract hrefs, then group them by path template and page type.
+6. Many links may open PDF documents — record these URLs but do not navigate into them.
+7. If a page redirects to a login page, record the redirect and continue with a different representative candidate.
+8. Government sites often have dozens of similar pages — sample representative service/entity/life-event pages and stop when target evidence is collected.
+"""
+        return ""
+
+    @staticmethod
+    def _target_page_records(max_interactions: int) -> int:
+        """Target representative page count for one exploration pass."""
+        return max(4, min(15, max_interactions // 8))
+
+    @staticmethod
+    def _target_flow_records(max_interactions: int) -> int:
+        """Target representative flow count for one exploration pass."""
+        return max(3, min(8, max_interactions // 12))
+
+    def _build_exploration_prompt(self, config: ExplorationConfig) -> str:
+        """Build the prompt for the exploration agent."""
+
+        # Build authentication section
+        auth_section = ""
+        if config.credentials:
+            login_url = config.login_url or config.entry_url
+            username = config.credentials.get("username", "")
+            password = config.credentials.get("password", "")
+
+            auth_section = f"""
+## Step 1: Authentication Required
+
+Before exploring, you MUST log in first:
+
+1. Navigate to: {login_url}
+2. Find the login form (email/username field + password field)
+3. Enter username/email: `{username}` (use this ACTUAL value)
+4. Enter password: `{password}` (use this ACTUAL value)
+5. Click the login/submit button
+6. Wait for authentication to complete
+7. Verify login succeeded (look for dashboard, user menu, or logout button)
+
+**CRITICAL**: Do not proceed until login is successful.
+
+When recording credentials in output, use placeholders:
+- Username: `{{{{LOGIN_USERNAME}}}}`
+- Password: `{{{{LOGIN_PASSWORD}}}}`
+"""
+        elif config.browser_auth_context and config.browser_auth_context.get("storage_state_attached"):
+            session_name = (
+                config.browser_auth_context.get("browser_auth_session_name")
+                or config.browser_auth_context.get("browser_auth_session_id")
+                or "selected session"
+            )
+            auth_section = f"""
+## Authentication Context
+
+The browser starts authenticated with saved session `{session_name}`. Begin exploration from the target URL and verify that authenticated areas are available before mapping flows.
+
+Do not log out unless explicitly instructed.
+"""
+
+        # Build focus areas section
+        focus_section = ""
+        if config.focus_areas:
+            focus_section = f"""
+## Priority Areas
+Focus your exploration on these areas first:
+{chr(10).join(f"- {area}" for area in config.focus_areas)}
+"""
+
+        # Build exclude patterns section
+        exclude_section = ""
+        if config.exclude_patterns:
+            exclude_section = f"""
+## URLs to Skip
+Do not explore URLs matching these patterns:
+{chr(10).join(f"- {pattern}" for pattern in config.exclude_patterns)}
+"""
+
+        # Build additional instructions section
+        instructions_section = ""
+        if config.additional_instructions:
+            instructions_section = f"""
+## Additional Instructions
+{config.additional_instructions}
+"""
+
+        strategy_instructions = {
+            "goal_directed": """
+**Goal-Directed Strategy**: Explore intelligently based on importance and representative coverage:
+- Build a candidate queue by mapping important links from the entry page
+- Prioritize distinct page types and capabilities: forms, primary actions, service/detail pages, search/filter, login, tabs, language switching, and error states
+- Sample equivalent URLs instead of crawling every similar page template
+- On each selected page: record a page object, exercise the primary action when safe, then move to a different capability
+- Stop when the evidence targets are met or no new capability appears after several actions
+""",
+            "breadth_first": """
+**Breadth-First Strategy — Representative Coverage**:
+Exploration proceeds by URL levels, but samples representative pages instead of exhausting the site:
+
+LEVEL 0: The entry URL — visit it and build candidate links
+LEVEL 1: Visit distinct high-value links discovered directly from LEVEL 0
+LEVEL 2+: Visit only links that expose a new page type, form, flow, or action
+
+Selection rule: choose the next URL that is most likely to reveal a new capability. Skip near-duplicates that share the same path template and visible controls.
+
+On each selected page: take a snapshot, emit a page record, record links, interact with 1-2 important elements, then move on.
+Track your level in each status report.
+""",
+            "depth_first": """
+**Depth-First Strategy**: Follow paths deeply before backtracking:
+- Pick one high-value user flow from the candidate queue and follow it through its meaningful sub-pages
+- Record all transitions and flows along the path
+- When the path ends (dead end or loops back), backtrack and pick the next queued URL
+- Prioritize completing flows over breadth
+- Stop after covering the target number of distinct flows/page types; do not exhaust all similar queued URLs
+""",
+            "api_focused": """
+**API-Focused Strategy**: Maximize API endpoint discovery with rich data capture:
+- After EVERY interaction, call browser_network_requests to capture all API calls
+- Parse the network log to extract full request/response details (headers, bodies, status codes)
+- Prioritize form submissions, button clicks, and navigation that trigger API calls
+- Try multiple input variations to discover different API behaviors and error responses
+- Document authentication patterns (Bearer tokens, cookies, API keys)
+- Filter out static assets (js, css, images, fonts) and third-party requests before reporting
+- Focus on breadth of API discovery over depth of individual flow exploration
+""",
+        }
+
+        # Build API-focused specific sections
+        is_api_focused = config.strategy == "api_focused"
+
+        # Try loading the rich api-explorer agent prompt from .md file
+        api_explorer_prompt = (
+            self._load_agent_prompt("api-explorer") if is_api_focused else None
+        )
+
+        if is_api_focused and api_explorer_prompt:
+            # Use the comprehensive api-explorer.md protocol instead of inline instructions.
+            # The .md file contains 6 phases, filtering rules, data masking tables, test data
+            # strategy, and detailed output format — much richer than the inline version.
+            mission_section = api_explorer_prompt
+            output_section = ""  # Already included in the .md content
+        elif is_api_focused:
+            # Fallback: inline prompt if api-explorer.md is not found
+            mission_section = """## Your Mission
+
+Systematically explore this web application to discover ALL API endpoints with rich request/response data:
+1. **API endpoints with full details** (headers, request bodies, response bodies) - THIS IS THE PRIMARY GOAL
+2. Authentication patterns (Bearer tokens, cookies, API keys)
+3. User flows that trigger API calls
+4. Error responses and validation behaviors
+5. All pages and their data-loading endpoints
+
+## API Data Capture (CRITICAL)
+
+**Capturing rich API data is your MOST IMPORTANT objective.** After EVERY interaction:
+1. Call `browser_network_requests` to get the network log
+2. Parse the output to identify API calls (filter out static assets like .js, .css, images, fonts)
+3. For each API call, extract method, URL, status, request headers, request body, and response body
+4. Include this data in the `richApiCalls` array of your transition record
+5. Truncate response bodies to ~2000 characters
+6. Mask sensitive data (passwords, tokens) with `***`
+
+## Flow Detection
+
+Also output flow records when you complete user journeys (secondary goal):
+- Output a `{"flow": ...}` JSON record after completing any user journey
+- Focus especially on flows that involve API interactions"""
+
+            output_section = """## Output Format
+
+After EACH interaction, output a transition record with rich API data:
+
+```json
+{"transition": {
+  "sequence": 1,
+  "action": {
+    "type": "click",
+    "element": {"ref": "btn1", "role": "button", "name": "Submit"},
+    "value": null
+  },
+  "before": {
+    "url": "https://example.com/login",
+    "pageType": "login",
+    "keyElements": ["Email input", "Password input", "Login button"]
+  },
+  "after": {
+    "url": "https://example.com/dashboard",
+    "pageType": "dashboard",
+    "keyElements": ["Welcome message", "Navigation menu"],
+    "changes": ["Navigated to dashboard", "User is now authenticated"]
+  },
+  "transitionType": "navigation",
+  "apiCalls": [{"method": "POST", "url": "/api/auth/login", "status": 200}],
+  "richApiCalls": [
+    {
+      "method": "POST",
+      "url": "https://example.com/api/auth/login",
+      "status": 200,
+      "requestHeaders": {"Content-Type": "application/json", "Authorization": "Bearer ***"},
+      "requestBody": "{\\"email\\":\\"***\\",\\"password\\":\\"***\\"}",
+      "responseBody": "{\\"token\\":\\"***\\",\\"user\\":{...}}",
+      "contentType": "application/json"
+    }
+  ]
+}}
+```
+
+When you complete a user flow, output:
+
+```json
+{"flow": {
+  "name": "User Login",
+  "category": "authentication",
+  "steps": [
+    {"action": "fill", "element": "Email input", "value": "{{LOGIN_EMAIL}}"},
+    {"action": "fill", "element": "Password input", "value": "{{LOGIN_PASSWORD}}"},
+    {"action": "click", "element": "Login button"}
+  ],
+  "startUrl": "/login",
+  "endUrl": "/dashboard",
+  "outcome": "User authenticated and redirected to dashboard",
+  "isSuccessPath": true,
+  "preconditions": ["User not logged in"],
+  "postconditions": ["User authenticated", "Session created"]
+}}
+```
+
+At the END of exploration, output a summary with COUNTS ONLY:
+
+```json
+{"summary": {
+  "pagesDiscovered": 10,
+  "flowsDiscovered": 5,
+  "elementsInteracted": 47,
+  "apiEndpointsFound": 25,
+  "issuesFound": 2,
+  "status": "completed"
+}}
+```"""
+        else:
+            mission_section = """## Your Mission
+
+Systematically explore this web application to discover:
+1. **User flows** (sequences of actions that accomplish tasks) - THIS IS THE PRIMARY GOAL
+2. All pages and their purposes
+3. Form behaviors (what happens when submitted)
+4. API endpoints (from network requests)
+5. Error states (what happens with invalid input)
+
+## Flow Detection (CRITICAL)
+
+**Discovering user flows is your MOST IMPORTANT objective.** A flow is any sequence of related actions that accomplish a user task (logging in, submitting a form, navigating to find information, searching, etc.).
+
+**Rules for flow detection:**
+- Output a `{"flow": ...}` JSON record IMMEDIATELY after completing any user journey
+- After every 5 interactions, stop and ask yourself: "Did I just complete a flow?" If yes, output it NOW
+- It is BETTER to output overlapping or redundant flows than to MISS a flow
+- Even simple sequences count: navigating to a page and reading content is a "Page Browse" flow
+- Every form submission (success or failure) is a flow
+- Every navigation path through 2+ pages is a flow"""
+
+            output_section = """## Output Format
+
+When you visit or inspect a page/state, output a page record:
+
+```json
+{"page": {
+  "url": "https://example.com/login",
+  "title": "Login",
+  "pageType": "login",
+  "purpose": "Allows users to authenticate",
+  "keyElements": ["Email input", "Password input", "Login button"],
+  "forms": [{"name": "Login form", "fields": ["Email", "Password"], "submit": "Login button"}],
+  "actions": ["Submit credentials", "Recover password"],
+  "links": [{"text": "Forgot password", "href": "https://example.com/reset"}]
+}}
+```
+
+After EACH interaction, output a transition record:
+
+```json
+{"transition": {
+  "sequence": 1,
+  "action": {
+    "type": "click",
+    "element": {"ref": "btn1", "role": "button", "name": "Submit"},
+    "value": null
+  },
+  "before": {
+    "url": "https://example.com/login",
+    "pageType": "login",
+    "keyElements": ["Email input", "Password input", "Login button"]
+  },
+  "after": {
+    "url": "https://example.com/dashboard",
+    "pageType": "dashboard",
+    "keyElements": ["Welcome message", "Navigation menu", "Logout button"],
+    "changes": ["Navigated to dashboard", "User is now authenticated"]
+  },
+  "transitionType": "navigation",
+  "apiCalls": [{"method": "POST", "url": "/api/auth/login", "status": 200}]
+}}
+```
+
+When you complete a user flow (IMMEDIATELY after the last step), output:
+
+```json
+{"flow": {
+  "name": "User Login",
+  "category": "authentication",
+  "steps": [
+    {"action": "fill", "element": "Email input", "value": "{{LOGIN_EMAIL}}"},
+    {"action": "fill", "element": "Password input", "value": "{{LOGIN_PASSWORD}}"},
+    {"action": "click", "element": "Login button"}
+  ],
+  "startUrl": "/login",
+  "endUrl": "/dashboard",
+  "outcome": "User authenticated and redirected to dashboard",
+  "isSuccessPath": true,
+  "preconditions": ["User not logged in"],
+  "postconditions": ["User authenticated", "Session created"]
+}}
+```
+
+When you discover an issue or bug, output an issue record:
+
+```json
+{"issue": {
+  "type": "broken_link|error_page|accessibility|performance|usability|security|missing_content",
+  "severity": "critical|high|medium|low",
+  "url": "https://example.com/broken-page",
+  "description": "Description of the issue found",
+  "element": "Element that triggered the issue",
+  "evidence": "Console error, HTTP status, or visual evidence"
+}}
+```
+
+At the END of exploration, output a summary with COUNTS ONLY (do NOT re-output flow or issue records that were already output above):
+
+```json
+{"summary": {
+  "pagesDiscovered": 10,
+  "flowsDiscovered": 5,
+  "elementsInteracted": 47,
+  "apiEndpointsFound": 12,
+  "issuesFound": 2,
+  "status": "completed"
+}}
+```"""
+
+        target_pages = self._target_page_records(config.max_interactions)
+        target_flows = self._target_flow_records(config.max_interactions)
+
+        prompt = f"""You are the App Explorer Agent.
+
+# Task: Explore the Web Application
+
+**Entry URL**: {config.entry_url}
+**Max Interactions**: {config.max_interactions}
+**Max Depth**: {config.max_depth} navigation levels from entry
+**Target Page Records**: {target_pages}
+**Target Flow Records**: {target_flows}
+
+{auth_section}
+
+## Exploration Strategy
+{strategy_instructions.get(config.strategy, strategy_instructions["goal_directed"])}
+
+{focus_section}
+{exclude_section}
+{instructions_section}
+{self._get_site_type_instructions(config.entry_url)}
+{mission_section}
+
+## Execution Steps
+
+### Step 1: Map the Site (Phase 0 — MANDATORY)
+1. Call `browser_navigate` to go to: {config.entry_url}
+2. Call `browser_wait_for` with 5s
+3. Call `browser_take_screenshot` with filename `live-step-001.png` so the dashboard has immediate visual evidence
+4. Handle any popups (cookie consent, language selector) immediately
+5. Call `browser_snapshot` to see the page structure
+6. Call `browser_evaluate` with `() => Array.from(document.querySelectorAll('a[href]')).map(a => ({{text: a.textContent.trim().slice(0,50), href: a.href}})).filter(a => a.href && !a.href.startsWith('javascript:') && a.text)` to extract ALL links
+7. Hover over only the top-level navigation items that are visible and likely to reveal important app areas
+8. Build a CANDIDATE_QUEUE from discovered links, grouped by page type/path template
+9. Pick representative candidates. Do not attempt to crawl every link.
+
+### Step 2: Explore Representative Pages
+For each selected URL in CANDIDATE_QUEUE:
+1. Navigate to it, wait for load (`browser_wait_for` with 5s)
+2. Call `browser_take_screenshot` with the next `live-step-XXX.png` filename before analysis
+3. Take snapshot + extract links (add new ones to queue)
+4. Output one `page` JSON record that captures the page purpose, key elements, available forms/actions, and important links
+5. Interact with important elements (forms, buttons, search)
+6. Call `browser_network_requests` after interactions to find API calls
+7. Record transition for each interaction
+8. **Check: Did this complete a user flow? If yes, output a flow record NOW**
+
+### Step 3: Budget-Aware Loop
+After each interaction, report your status and check the loop contract:
+
+```
+STEP [N of {config.max_interactions}] — Budget remaining: [Y]
+CANDIDATE_QUEUE: [M URLs remaining]
+Continue: [reason]
+```
+
+Stop and emit final summary when ANY of these conditions is met:
+a. You have emitted at least {target_pages} page records and {target_flows} flow records
+b. You have used 80% of the {config.max_interactions} interaction budget
+c. 3 consecutive actions found no new page type, form, action, API, or flow
+d. The remaining candidates are near-duplicates of already observed page templates
+
+If you reach interaction {config.max_interactions // 2} (halfway) and have only visited
+{max(2, config.max_interactions // 10)} or fewer unique pages, switch to breadth-first:
+visit your queued URLs before exploring the current page further.
+
+When stopping, output any missing flow records you can infer from observed page records and transitions, then output the final summary. Never restart the exploration from the entry URL unless the browser lost the page entirely.
+
+{output_section}
+
+{self._build_rules_section(api_explorer_prompt is not None)}
+"""
+        metadata = build_prompt_metadata(
+            prompt_id=f"app_explorer.{config.strategy}",
+            version="2026-05-13.1",
+            stage="exploration",
+            schema_name="exploration_records.v1",
+            rendered_prompt=prompt,
+        )
+        self._last_prompt_metadata = metadata.to_dict()
+        return attach_prompt_metadata(prompt, metadata)
+
+    async def _run_explorer_agent(
+        self, prompt: str, session_dir: Path, config: ExplorationConfig
+    ) -> str:
+        """Run the exploration agent and capture output using AgentRunner."""
+        exploration_session_id = session_dir.name
+
+        # Get timeout from environment or use 30 minutes default
+        timeout = int(
+            os.environ.get("EXPLORATION_TIMEOUT_SECONDS", get_default_timeout())
+        )
+
+        logger.info(f"   Timeout: {timeout}s ({timeout // 60} minutes)")
+
+        # Create per-session MCP config for browser isolation.
+        # Use a schema-correct Playwright MCP package. Older 0.0.28 builds expose
+        # connected MCP servers with invalid/empty tool schemas, which makes
+        # Claude silently lose access to browser tools.
+        runtime = write_playwright_mcp_config(
+            run_dir=session_dir,
+            server_name="playwright-test",
+            storage_state_path=config.storage_state_path,
+        )
+        logger.info(
+            "   Created MCP config (runtime=%s, live=%s, command=%s): %s",
+            runtime["browser_runtime"],
+            runtime["live_view_available"],
+            runtime["mcp_command"],
+            runtime["mcp_config_path"],
+        )
+
+        # Copy .claude/ agent artifacts for isolation without local settings.
+        project_root = Path(__file__).resolve().parent.parent.parent
+        copy_claude_project_config(project_root / ".claude", session_dir / ".claude")
+
+        # Change CWD to session_dir so the SDK finds our .mcp.json
+        original_cwd = os.getcwd()
+        os.chdir(session_dir)
+        logger.info(f"   CWD set to: {session_dir}")
+
+        try:
+            # Track interactions for progress reporting
+            interaction_count = [0]
+
+            def on_tool_use(tool_name: str, tool_input: dict):
+                """Callback when a tool is used."""
+                if tool_name.startswith("mcp__playwright"):
+                    interaction_count[0] += 1
+                    if interaction_count[0] % 10 == 0:
+                        logger.info(f"   Interactions: {interaction_count[0]}")
+                if self.on_tool_use:
+                    self.on_tool_use(tool_name, tool_input)
+
+            # Use the unified AgentRunner
+            profile_name = (
+                "api-explorer" if config.strategy == "api_focused" else "app-explorer"
+            )
+            runner = AgentRunner(
+                timeout_seconds=timeout,
+                allowed_tools=get_agent_allowed_tools(profile_name),
+                log_tools=True,
+                on_tool_use=on_tool_use,
+                on_progress=self.on_progress,
+                session_dir=session_dir,
+                on_task_enqueued=self.on_task_enqueued,
+                max_browser_tool_calls=config.max_interactions,
+                owner_type=self.owner_type,
+                owner_id=self.owner_id,
+                owner_label=self.owner_label,
+                model_tier=config.model_tier or "tool_deep",
+                preserve_browser_on_failure=self.owner_type == "autopilot",
+                autopilot_retry_enabled=self.owner_type == "autopilot",
+                autopilot_session_id=self.owner_id if self.owner_type == "autopilot" else None,
+                autopilot_stable_key=f"explore:{exploration_session_id}",
+                autopilot_agent_kind="exploration",
+                autopilot_source_type="exploration_session",
+                autopilot_source_id=exploration_session_id,
+                autopilot_checklist_title=f"Exploring {config.entry_url}",
+                autopilot_phase_name="exploration",
+                autopilot_checklist_kind="exploration",
+            )
+
+            result = await runner.run(prompt)
+            browser_tool_calls = [
+                call
+                for call in result.tool_calls
+                if call.name.startswith("mcp__") and "__browser_" in call.name
+            ]
+            successful_browser_tool_calls = sum(
+                1 for call in browser_tool_calls if call.success
+            )
+            self._last_agent_stats = {
+                "messages_received": result.messages_received,
+                "text_blocks_received": result.text_blocks_received,
+                "tool_calls": len(result.tool_calls),
+                "browser_tool_calls": len(browser_tool_calls),
+                "successful_browser_tool_calls": successful_browser_tool_calls,
+                "duration_seconds": result.duration_seconds,
+                "timed_out": result.timed_out,
+                "budget_stopped": self._is_budget_stop(result.error),
+                "max_browser_tool_calls": config.max_interactions,
+            }
+
+            # Log diagnostics
+            logger.info(
+                f"   Agent stats: {result.messages_received} messages, "
+                f"{len(result.tool_calls)} tool calls "
+                f"({successful_browser_tool_calls}/{len(browser_tool_calls)} successful browser), "
+                f"{result.duration_seconds:.1f}s"
+            )
+
+            if result.timed_out:
+                if not result.output or not result.output.strip():
+                    raise RuntimeError(
+                        f"Explorer agent timed out after {result.duration_seconds:.0f}s "
+                        f"without producing any output. "
+                        f"Messages: {result.messages_received}, Tool calls: {len(result.tool_calls)}. "
+                        f"This usually means the MCP server failed to start or the model returned no response."
+                    )
+                logger.warning(
+                    f"   Agent timed out - returning partial results ({len(result.output)} chars)"
+                )
+                return result.output
+
+            # Raise on agent failure (mirrors requirements_generator.py pattern)
+            if not result.success and result.error:
+                if (
+                    self._is_budget_stop(result.error)
+                    and result.output
+                    and result.output.strip()
+                ):
+                    logger.warning(
+                        "   Browser tool budget reached - returning partial results "
+                        f"({len(result.output)} chars)"
+                    )
+                    return result.output
+                raise RuntimeError(f"Explorer agent failed: {result.error}")
+
+            # Raise on empty output (agent ran but produced nothing)
+            if not result.output or not result.output.strip():
+                raise RuntimeError(
+                    "Explorer agent returned empty output — likely an authentication, "
+                    "MCP configuration, or model connectivity issue. "
+                    "Check backend logs for details."
+                )
+
+            return result.output
+        finally:
+            # Always restore CWD
+            os.chdir(original_cwd)
+            logger.info(f"   CWD restored to: {original_cwd}")
+
+    def _build_playwright_mcp_server_config(self) -> dict[str, Any]:
+        """Return a reliable Playwright MCP server command.
+
+        The local node_modules binary is used only when it is new enough to expose
+        valid JSON schemas for tools. Environment overrides keep Docker/custom
+        installs configurable.
+        """
+        return build_playwright_mcp_server_config(Path(__file__).resolve().parent.parent.parent)
+
+    @staticmethod
+    def _is_package_version_at_least(package_json: Path, minimum: str) -> bool:
+        """Return whether package_json declares a semver version >= minimum."""
+        return is_package_version_at_least(package_json, minimum)
+
+    def _is_unverified_agent_output(self, raw_output: str | None) -> bool:
+        """Detect agent output that explicitly admits it was not live browser exploration."""
+        if not raw_output:
+            return False
+        lowered = raw_output.lower()
+        indicators = [
+            "browser interaction tools are not available",
+            "browser tools are not available",
+            "don't have browser tools",
+            "do not have browser tools",
+            "without live browser interaction",
+            "not freshly verified",
+            "prior exploration knowledge",
+            "constructed the output from prior",
+            "based on well-known",
+            "based on stable information",
+        ]
+        return any(indicator in lowered for indicator in indicators)
+
+    @staticmethod
+    def _count_browser_artifact_evidence(session_dir: Path) -> int:
+        """Count MCP/browser artifacts that prove the explorer interacted with a live page."""
+        artifact_dir = session_dir / "artifacts"
+        evidence = 0
+        if artifact_dir.exists():
+            evidence += len(list(artifact_dir.glob("page-*.yml")))
+            evidence += len(list(artifact_dir.glob("console-*.log")))
+        evidence += len(list(session_dir.glob("live-step-*.png")))
+        memory_artifact = session_dir / "browser-memory-observations.jsonl"
+        if memory_artifact.exists():
+            try:
+                evidence += sum(1 for line in memory_artifact.read_text().splitlines() if line.strip())
+            except OSError:
+                evidence += 1
+        return evidence
+
+    @staticmethod
+    def _is_budget_stop(error: str | None) -> bool:
+        """Return whether an agent error is the intentional browser budget stop."""
+        return bool(error and "browser tool budget reached" in error.lower())
+
+    @staticmethod
+    def _normalize_action_element(value: Any) -> dict[str, Any]:
+        """Normalize loose agent element output into the dict shape used downstream."""
+        if isinstance(value, dict):
+            return value
+        if value is None:
+            return {}
+        if isinstance(value, str):
+            stripped = value.strip()
+            return {"name": stripped} if stripped else {}
+        try:
+            if isinstance(value, (list, tuple, set)) and not value:
+                return {}
+        except TypeError:
+            pass
+        text = str(value).strip()
+        return {"name": text} if text else {}
+
+    @staticmethod
+    def _normalize_api_call(value: Any) -> dict[str, Any] | None:
+        """Normalize loose API call entries before endpoint extraction."""
+        if isinstance(value, dict):
+            return value
+        if value is None:
+            return None
+        text = str(value).strip()
+        return {"url": text} if text else None
+
+    @classmethod
+    def _normalize_api_calls(cls, value: Any) -> list[dict[str, Any]]:
+        if not value:
+            return []
+        if isinstance(value, dict):
+            candidates = [value]
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            candidates = [value]
+        calls: list[dict[str, Any]] = []
+        for item in candidates:
+            normalized = cls._normalize_api_call(item)
+            if normalized is not None:
+                calls.append(normalized)
+        return calls
+
+    def _deduplicate_flows(self, flows: list[FlowRecord]) -> list[FlowRecord]:
+        """Deduplicate flows by normalized (name, start_url, end_url) tuple. Keeps first occurrence."""
+        seen = set()
+        unique_flows = []
+        for flow in flows:
+            key = (
+                flow.name.strip().lower(),
+                flow.start_url.strip().rstrip("/").lower(),
+                flow.end_url.strip().rstrip("/").lower(),
+            )
+            if key not in seen:
+                seen.add(key)
+                unique_flows.append(flow)
+        return unique_flows
+
+    def _deduplicate_transitions(
+        self, transitions: list[TransitionRecord]
+    ) -> list[TransitionRecord]:
+        """Deduplicate transitions by key fields. Keeps first occurrence."""
+        seen = set()
+        unique = []
+        for t in transitions:
+            action_element = self._normalize_action_element(t.action_element)
+            elem_name = action_element.get("name", "")
+            key = (
+                t.sequence,
+                t.before_url.strip().rstrip("/").lower(),
+                t.after_url.strip().rstrip("/").lower(),
+                t.action_type.strip().lower(),
+                elem_name.strip().lower(),
+            )
+            if key not in seen:
+                seen.add(key)
+                unique.append(t)
+        return unique
+
+    def _merge_page_record(
+        self, pages_by_url: dict[str, PageRecord], page: PageRecord
+    ) -> None:
+        """Merge page evidence by URL, preserving the richest observed fields."""
+        url = page.url.strip()
+        if not url or url == "about:blank":
+            return
+        existing = pages_by_url.get(url)
+        if not existing:
+            pages_by_url[url] = page
+            return
+
+        existing.title = existing.title or page.title
+        existing.page_type = existing.page_type or page.page_type
+        existing.purpose = existing.purpose or page.purpose
+        existing.key_elements = self._dedupe_strings(
+            existing.key_elements + page.key_elements
+        )
+        existing.forms = self._dedupe_dicts(existing.forms + page.forms)
+        existing.actions = self._dedupe_strings(existing.actions + page.actions)
+        existing.links = self._dedupe_dicts(existing.links + page.links)
+
+    def _merge_page_from_transition(
+        self,
+        pages_by_url: dict[str, PageRecord],
+        url: str | None,
+        page_type: str | None,
+        key_elements: list[str] | None,
+    ) -> None:
+        """Create/update a page record from transition before/after snapshots."""
+        if not url or url == "about:blank":
+            return
+        self._merge_page_record(
+            pages_by_url,
+            PageRecord(
+                url=url,
+                page_type=page_type,
+                key_elements=key_elements or [],
+            ),
+        )
+
+    @staticmethod
+    def _dedupe_strings(values: list[Any]) -> list[str]:
+        seen = set()
+        result = []
+        for value in values:
+            text = str(value).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(text)
+        return result
+
+    @staticmethod
+    def _dedupe_dicts(values: list[Any]) -> list[dict[str, Any]]:
+        seen = set()
+        result = []
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            key = json.dumps(value, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                result.append(value)
+        return result
+
+    def _extract_json_objects(self, raw_output: str) -> list[dict]:
+        """Extract all JSON objects from agent output using multiple strategies.
+
+        Strategy 1: ```json ... ``` code blocks (existing)
+        Strategy 2: Bare JSON objects starting with known prefixes
+        """
+        results = []
+        seen_json = set()
+
+        # Strategy 1: Extract from code blocks using boundary detection
+        # Find ```json or ``` markers and extract content between them
+        code_block_pattern = r"```(?:json)?\s*\n(.*?)\n\s*```"
+        for json_str in re.findall(code_block_pattern, raw_output, re.DOTALL):
+            json_str = json_str.strip()
+            if not json_str.startswith("{"):
+                continue
+            try:
+                data = json.loads(json_str)
+                # Use a normalized representation to deduplicate
+                key = json.dumps(data, sort_keys=True)
+                if key not in seen_json:
+                    seen_json.add(key)
+                    results.append(data)
+            except json.JSONDecodeError:
+                # Try fix truncated JSON
+                try:
+                    data = extract_json_from_markdown(f"```json\n{json_str}\n```")
+                    key = json.dumps(data, sort_keys=True)
+                    if key not in seen_json:
+                        seen_json.add(key)
+                        results.append(data)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+
+        # Strategy 2: Find bare JSON objects with known prefixes outside code blocks
+        # Remove code blocks first to avoid double-counting
+        stripped = re.sub(
+            r"```(?:json)?\s*\n.*?\n\s*```", "", raw_output, flags=re.DOTALL
+        )
+
+        # Look for JSON objects starting with known keys
+        bare_pattern = r'(\{"(?:transition|flow|summary|issue|page)"\s*:)'
+        for match in re.finditer(bare_pattern, stripped):
+            start = match.start()
+            # Use brace-depth counting to find the matching close brace
+            depth = 0
+            in_string = False
+            escape_next = False
+            end = start
+            for i in range(start, len(stripped)):
+                ch = stripped[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == "\\" and in_string:
+                    escape_next = True
+                    continue
+                if ch == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if not in_string:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+            if depth == 0 and end > start:
+                json_str = stripped[start:end]
+                try:
+                    data = json.loads(json_str)
+                    key = json.dumps(data, sort_keys=True)
+                    if key not in seen_json:
+                        seen_json.add(key)
+                        results.append(data)
+                except json.JSONDecodeError:
+                    continue
+
+        # Strategy 3: Rescue parse — case-insensitive keys + truncated JSON recovery
+        # Only runs when Strategies 1+2 found nothing
+        if not results:
+            rescue_pattern = (
+                r'(\{"(?:[Tt]ransition|[Ff]low|[Ss]ummary|[Ii]ssue|[Pp]age)"\s*:)'
+            )
+            for match in re.finditer(rescue_pattern, raw_output):
+                start = match.start()
+                # Brace-depth counting to find matching close brace
+                depth = 0
+                in_string = False
+                escape_next = False
+                end = start
+                for i in range(start, min(start + 50000, len(raw_output))):
+                    ch = raw_output[i]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if ch == "\\" and in_string:
+                        escape_next = True
+                        continue
+                    if ch == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if not in_string:
+                        if ch == "{":
+                            depth += 1
+                        elif ch == "}":
+                            depth -= 1
+                            if depth == 0:
+                                end = i + 1
+                                break
+                if depth == 0 and end > start:
+                    json_str = raw_output[start:end]
+                    try:
+                        data = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        # Try truncated JSON recovery
+                        try:
+                            data = extract_json_from_markdown(
+                                f"```json\n{json_str}\n```"
+                            )
+                        except (ValueError, json.JSONDecodeError):
+                            continue
+                    if isinstance(data, dict):
+                        # Normalize top-level key to lowercase
+                        normalized = {}
+                        for k, v in data.items():
+                            normalized[k.lower()] = v
+                        key = json.dumps(normalized, sort_keys=True)
+                        if key not in seen_json:
+                            seen_json.add(key)
+                            results.append(normalized)
+                elif depth > 0:
+                    # Truncated JSON — try extract_json_from_markdown recovery
+                    json_str = raw_output[start : min(start + 50000, len(raw_output))]
+                    try:
+                        data = extract_json_from_markdown(f"```json\n{json_str}\n```")
+                        if isinstance(data, dict):
+                            normalized = {k.lower(): v for k, v in data.items()}
+                            key = json.dumps(normalized, sort_keys=True)
+                            if key not in seen_json:
+                                seen_json.add(key)
+                                results.append(normalized)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+
+            if results:
+                logger.info(
+                    f"Strategy 3 (rescue parse) recovered {len(results)} JSON objects"
+                )
+
+        return results
+
+    def _parse_exploration_output(
+        self,
+        raw_output: str,
+        session_id: str,
+        entry_url: str,
+        pre_extracted_json: list[dict] = None,
+    ) -> ExplorationResult:
+        """Parse the exploration agent's output into structured data.
+
+        Args:
+            pre_extracted_json: If provided, skip regex extraction and use
+                these objects directly (e.g. from AI JSON recovery).
+        """
+
+        transitions = []
+        flows = []
+        pages = []
+        page_records_by_url: dict[str, PageRecord] = {}
+        api_endpoints = []
+        issues = []
+        pages_seen = set()
+
+        # Handle empty input
+        if not raw_output or not raw_output.strip():
+            return ExplorationResult(
+                session_id=session_id,
+                entry_url=entry_url,
+                status="failed",
+                error_message="Agent returned empty output — no exploration data to parse",
+            )
+
+        # Use pre-extracted objects (from AI recovery) or extract via regex strategies
+        all_json_objects = (
+            pre_extracted_json
+            if pre_extracted_json is not None
+            else self._extract_json_objects(raw_output)
+        )
+
+        for data in all_json_objects:
+            try:
+                # Parse transition records
+                if "transition" in data:
+                    t = data["transition"]
+                    action = t.get("action") or {}
+                    before = t.get("before") or {}
+                    after = t.get("after") or {}
+                    action_element = self._normalize_action_element(action.get("element"))
+                    api_calls = self._normalize_api_calls(t.get("apiCalls"))
+
+                    transition = TransitionRecord(
+                        sequence=t.get("sequence") or len(transitions) + 1,
+                        action_type=action.get("type") or "unknown",
+                        action_element=action_element,
+                        action_value=action.get("value"),
+                        before_url=before.get("url") or "",
+                        before_page_type=before.get("pageType"),
+                        before_elements=before.get("keyElements") or [],
+                        after_url=after.get("url") or "",
+                        after_page_type=after.get("pageType"),
+                        after_elements=after.get("keyElements") or [],
+                        transition_type=t.get("transitionType") or "unknown",
+                        api_calls=api_calls,
+                        changes_description=", ".join(after.get("changes") or []),
+                    )
+                    transitions.append(transition)
+
+                    # Track pages
+                    if before.get("url") and before["url"] != "about:blank":
+                        pages_seen.add(before["url"])
+                    if after.get("url") and after["url"] != "about:blank":
+                        pages_seen.add(after["url"])
+
+                    # Extract API endpoints - prefer richApiCalls for detailed data
+                    rich_calls = self._normalize_api_calls(t.get("richApiCalls"))
+                    basic_calls = api_calls
+                    triggered_by = f"{action.get('type') or 'unknown'} on {action_element.get('name') or 'element'}"
+
+                    if rich_calls:
+                        for api_call in rich_calls:
+                            endpoint = {
+                                "method": api_call.get("method") or "GET",
+                                "url": api_call.get("url") or "",
+                                "status": api_call.get("status"),
+                                "triggered_by": triggered_by,
+                                "request_headers": api_call.get("requestHeaders"),
+                                "request_body": api_call.get("requestBody"),
+                                "response_body": api_call.get("responseBody"),
+                            }
+                            # Deduplicate by method+url, but update with rich data if already seen
+                            existing = next(
+                                (
+                                    e
+                                    for e in api_endpoints
+                                    if e["method"] == endpoint["method"]
+                                    and e["url"] == endpoint["url"]
+                                ),
+                                None,
+                            )
+                            if existing:
+                                # Merge rich data into existing entry if it was missing
+                                if endpoint.get("request_headers") and not existing.get(
+                                    "request_headers"
+                                ):
+                                    existing["request_headers"] = endpoint[
+                                        "request_headers"
+                                    ]
+                                if endpoint.get("request_body") and not existing.get(
+                                    "request_body"
+                                ):
+                                    existing["request_body"] = endpoint["request_body"]
+                                if endpoint.get("response_body") and not existing.get(
+                                    "response_body"
+                                ):
+                                    existing["response_body"] = endpoint[
+                                        "response_body"
+                                    ]
+                            else:
+                                api_endpoints.append(endpoint)
+                    else:
+                        for api_call in basic_calls:
+                            endpoint = {
+                                "method": api_call.get("method") or "GET",
+                                "url": api_call.get("url") or "",
+                                "status": api_call.get("status"),
+                                "triggered_by": triggered_by,
+                            }
+                            if not any(
+                                e["method"] == endpoint["method"]
+                                and e["url"] == endpoint["url"]
+                                for e in api_endpoints
+                            ):
+                                api_endpoints.append(endpoint)
+
+                # Parse flow records
+                elif "flow" in data:
+                    f = data["flow"]
+                    flow = FlowRecord(
+                        name=f.get("name") or "Unnamed Flow",
+                        category=f.get("category") or "unknown",
+                        steps=f.get("steps") or [],
+                        start_url=f.get("startUrl") or "",
+                        end_url=f.get("endUrl") or "",
+                        outcome=f.get("outcome") or "",
+                        is_success_path=f.get("isSuccessPath", True),
+                        preconditions=f.get("preconditions") or [],
+                        postconditions=f.get("postconditions") or [],
+                    )
+                    flows.append(flow)
+
+                # Parse page records
+                elif "page" in data:
+                    p = data["page"]
+                    url = str(p.get("url") or "").strip()
+                    if not url or url == "about:blank":
+                        continue
+                    page = PageRecord(
+                        url=url,
+                        title=p.get("title"),
+                        page_type=p.get("pageType") or p.get("page_type"),
+                        purpose=p.get("purpose"),
+                        key_elements=p.get("keyElements")
+                        or p.get("key_elements")
+                        or [],
+                        forms=p.get("forms") or [],
+                        actions=p.get("actions") or [],
+                        links=p.get("links") or [],
+                    )
+                    self._merge_page_record(page_records_by_url, page)
+                    pages_seen.add(url)
+
+                # Parse issue records
+                elif "issue" in data:
+                    iss = data["issue"]
+                    issue = IssueRecord(
+                        issue_type=iss.get("type") or "unknown",
+                        severity=iss.get("severity") or "medium",
+                        url=iss.get("url") or "",
+                        description=iss.get("description") or "",
+                        element=iss.get("element"),
+                        evidence=iss.get("evidence"),
+                    )
+                    issues.append(issue)
+
+                # Parse summary
+                elif "summary" in data:
+                    summary = data["summary"]
+                    # Use summary data to augment page count — never undercount
+                    summary_pages = summary.get("pagesDiscovered") or 0
+                    if summary_pages > len(pages_seen):
+                        # Add placeholder entries to reach the summary count
+                        for i in range(summary_pages - len(pages_seen)):
+                            pages_seen.add(f"__summary_page_{i}")
+
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+
+        # Auto-create issues from error transitions
+        for t in transitions:
+            if t.transition_type == "error":
+                action_element = self._normalize_action_element(t.action_element)
+                issues.append(
+                    IssueRecord(
+                        issue_type="error_page",
+                        severity="high",
+                        url=t.after_url or t.before_url,
+                        description=t.changes_description
+                        or f"Error encountered during {t.action_type}",
+                        element=action_element.get("name"),
+                    )
+                )
+
+        # Deduplicate flows and transitions
+        flows = self._deduplicate_flows(flows)
+        transitions = self._deduplicate_transitions(transitions)
+        for t in transitions:
+            self._merge_page_from_transition(
+                page_records_by_url, t.before_url, t.before_page_type, t.before_elements
+            )
+            self._merge_page_from_transition(
+                page_records_by_url, t.after_url, t.after_page_type, t.after_elements
+            )
+        pages = list(page_records_by_url.values())
+
+        # Infer flows from transitions if agent didn't emit enough
+        inferred = self._infer_flows_from_transitions(transitions, flows)
+        if inferred:
+            logger.info(
+                f"   Inferred {len(inferred)} additional flows from transitions"
+            )
+            flows.extend(inferred)
+
+        # Calculate elements discovered from transitions
+        elements_discovered = set()
+        for t in transitions:
+            action_elem = self._normalize_action_element(t.action_element)
+            if action_elem.get("name"):
+                elements_discovered.add(action_elem["name"])
+            elements_discovered.update(t.before_elements or [])
+            elements_discovered.update(t.after_elements or [])
+
+        # Determine status based on results quality
+        status = "completed"
+        error_message = None
+
+        if not all_json_objects and raw_output.strip():
+            # Agent produced output but no structured JSON data
+            logger.warning(
+                f"Zero JSON objects from {len(raw_output)}-char output. First 500:\n{raw_output[:500]}"
+            )
+            if len(raw_output) > 500:
+                logger.warning(f"Last 500:\n{raw_output[-500:]}")
+            status = "failed"
+            error_message = (
+                "Agent produced output but no structured JSON data was found. "
+                "The agent may have encountered navigation issues or been blocked by the target site."
+            )
+        elif not transitions and not flows and not pages and not api_endpoints:
+            # JSON was found but nothing useful was extracted
+            status = "failed"
+            error_message = (
+                "Exploration completed but discovered zero pages, transitions, flows, and API endpoints. "
+                "The target site may have blocked automated access or the agent couldn't interact with the page."
+            )
+
+        return ExplorationResult(
+            session_id=session_id,
+            entry_url=entry_url,
+            status=status,
+            transitions=transitions,
+            flows=flows,
+            pages=pages,
+            api_endpoints=api_endpoints,
+            issues=issues,
+            pages_discovered=len(pages_seen),
+            elements_discovered=len(elements_discovered),
+            error_message=error_message,
+        )
+
+    def _infer_flows_from_transitions(
+        self, transitions: list[TransitionRecord], existing_flows: list[FlowRecord]
+    ) -> list[FlowRecord]:
+        """Infer user flows from transition patterns when the agent didn't emit flow JSON.
+
+        Segments transitions into logical groups and pattern-matches against
+        known flow archetypes (authentication, form submission, navigation, search).
+
+        Returns only flows that don't duplicate existing flow names.
+        """
+        if len(transitions) < 2:
+            return []
+
+        existing_names = {f.name.strip().lower() for f in existing_flows}
+        # Also track by (start_url, end_url) to avoid semantic duplicates
+        existing_keys = {
+            (
+                f.start_url.strip().rstrip("/").lower(),
+                f.end_url.strip().rstrip("/").lower(),
+            )
+            for f in existing_flows
+        }
+
+        inferred_flows = []
+
+        # Segment transitions into groups by detecting boundaries
+        segments = self._segment_transitions(transitions)
+
+        for segment in segments:
+            if len(segment) < 2:
+                continue
+
+            flow = self._classify_segment(segment)
+            if flow is None:
+                continue
+
+            # Check for duplicates against existing flows
+            name_key = flow.name.replace(" (inferred)", "").strip().lower()
+            url_key = (
+                flow.start_url.strip().rstrip("/").lower(),
+                flow.end_url.strip().rstrip("/").lower(),
+            )
+            if name_key in existing_names or url_key in existing_keys:
+                continue
+
+            existing_names.add(name_key)
+            existing_keys.add(url_key)
+            inferred_flows.append(flow)
+
+        return inferred_flows
+
+    def _minimum_expected_flows(self, result: ExplorationResult) -> int:
+        """Return a conservative lower bound for flow count based on observed breadth."""
+        pages = int(result.pages_discovered or len(result.pages) or 0)
+        transitions = len(result.transitions)
+        if pages <= 1 and transitions <= 2:
+            return 1
+        return max(
+            1, min(12, max(transitions // 5, pages // 8, 2 if pages >= 5 else 1))
+        )
+
+    def _synthesize_flows_from_pages(
+        self,
+        pages: list[PageRecord],
+        existing_flows: list[FlowRecord],
+        *,
+        limit: int,
+    ) -> list[FlowRecord]:
+        """Create page-capability flows when sparse agent output missed journeys."""
+        if limit <= 0:
+            return []
+
+        existing_keys = {
+            (
+                f.name.replace(" (synthesized)", "").strip().lower(),
+                f.start_url.strip().rstrip("/").lower(),
+                f.end_url.strip().rstrip("/").lower(),
+            )
+            for f in existing_flows
+        }
+        synthesized: list[FlowRecord] = []
+
+        for page in pages:
+            if len(synthesized) >= limit:
+                break
+            if not page.url or page.url.startswith("__summary_page_"):
+                continue
+
+            label = self._page_label(page)
+            capability_text = " ".join(
+                [
+                    label,
+                    page.page_type or "",
+                    page.purpose or "",
+                    " ".join(page.key_elements),
+                    " ".join(page.actions),
+                ]
+            ).lower()
+
+            if page.forms:
+                category = "form_submission"
+                name = f"{label} Form Submission (synthesized)"
+                steps = [
+                    {"action": "navigate", "element": "page", "value": page.url},
+                    {"action": "inspect", "element": self._first_form_name(page.forms)},
+                    {
+                        "action": "submit",
+                        "element": self._first_submit_name(page.forms),
+                    },
+                ]
+                outcome = f"User can complete the primary form on {label}"
+            elif any(term in capability_text for term in ("search", "filter", "query")):
+                category = "search"
+                name = f"{label} Search or Filter (synthesized)"
+                steps = [
+                    {"action": "navigate", "element": "page", "value": page.url},
+                    {
+                        "action": "interact",
+                        "element": self._first_relevant_control(
+                            page, ["search", "filter", "query"]
+                        ),
+                    },
+                ]
+                outcome = f"User can search or filter content on {label}"
+            else:
+                category = "navigation"
+                name = f"Browse {label} (synthesized)"
+                steps = [{"action": "navigate", "element": "page", "value": page.url}]
+                if page.actions:
+                    steps.append({"action": "inspect", "element": page.actions[0]})
+                outcome = page.purpose or f"User can reach and inspect {label}"
+
+            key = (
+                name.replace(" (synthesized)", "").strip().lower(),
+                page.url.strip().rstrip("/").lower(),
+                page.url.strip().rstrip("/").lower(),
+            )
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            synthesized.append(
+                FlowRecord(
+                    name=name,
+                    category=category,
+                    steps=steps,
+                    start_url=page.url,
+                    end_url=page.url,
+                    outcome=outcome,
+                    is_success_path=True,
+                    preconditions=[],
+                    postconditions=[outcome],
+                )
+            )
+
+        return synthesized
+
+    def _page_label(self, page: PageRecord) -> str:
+        raw = page.title or page.page_type or ""
+        if not raw:
+            try:
+                path = urlparse(page.url).path.strip("/")
+                raw = path.split("/")[-1] or path or "application page"
+            except Exception:
+                raw = "application page"
+        label = re.sub(r"[-_]+", " ", str(raw)).strip()
+        label = re.sub(r"\s+", " ", label)
+        return (label[:80] or "application page").title()
+
+    @staticmethod
+    def _first_form_name(forms: list[dict[str, Any]]) -> str:
+        if not forms:
+            return "form"
+        form = forms[0]
+        return str(form.get("name") or form.get("title") or "form")
+
+    @staticmethod
+    def _first_submit_name(forms: list[dict[str, Any]]) -> str:
+        if not forms:
+            return "submit button"
+        form = forms[0]
+        return str(form.get("submit") or form.get("submitButton") or "submit button")
+
+    @staticmethod
+    def _first_relevant_control(page: PageRecord, keywords: list[str]) -> str:
+        for value in page.actions + page.key_elements:
+            lowered = value.lower()
+            if any(keyword in lowered for keyword in keywords):
+                return value
+        return "relevant control"
+
+    def _segment_transitions(
+        self, transitions: list[TransitionRecord]
+    ) -> list[list[TransitionRecord]]:
+        """Segment transitions into logical flow groups.
+
+        Boundaries are detected by:
+        - URL discontinuity (after_url of prev != before_url of next)
+        - Navigation back to entry/home page
+        - Large gaps in sequence numbers
+        """
+        if not transitions:
+            return []
+
+        segments = []
+        current_segment = [transitions[0]]
+
+        for i in range(1, len(transitions)):
+            prev = transitions[i - 1]
+            curr = transitions[i]
+
+            # Detect boundary conditions
+            url_discontinuity = (
+                prev.after_url
+                and curr.before_url
+                and prev.after_url.strip().rstrip("/").lower()
+                != curr.before_url.strip().rstrip("/").lower()
+            )
+            sequence_gap = curr.sequence - prev.sequence > 3
+
+            if url_discontinuity or sequence_gap:
+                # Close current segment and start new one
+                if len(current_segment) >= 2:
+                    segments.append(current_segment)
+                current_segment = [curr]
+            else:
+                current_segment.append(curr)
+
+        # Don't forget the last segment
+        if len(current_segment) >= 2:
+            segments.append(current_segment)
+
+        return segments
+
+    async def _run_flow_synthesis_pass(
+        self,
+        transitions: list[TransitionRecord],
+        existing_flows: list[FlowRecord],
+        pages: list[PageRecord],
+        session_dir: Path,
+        *,
+        min_expected: int,
+    ) -> list[FlowRecord]:
+        """Run a second AI pass to identify flows from transitions when too few were found.
+
+        This is a pure text-analysis call (no browser tools needed) with a short timeout.
+        """
+        if not transitions and not pages:
+            return []
+
+        # Build a compact text representation of transitions
+        transition_lines = []
+        for t in transitions:
+            elem = self._normalize_action_element(t.action_element)
+            elem_desc = elem.get("name") or elem.get("role") or "element"
+            val = f' "{t.action_value}"' if t.action_value else ""
+            api_desc = ""
+            if t.api_calls:
+                api_desc = " | APIs: " + ", ".join(
+                    f"{a.get('method', '?')} {a.get('url', '?')} -> {a.get('status', '?')}"
+                    for a in self._normalize_api_calls(t.api_calls)
+                )
+            transition_lines.append(
+                f"  {t.sequence}. {t.action_type} on '{elem_desc}'{val} | "
+                f"{t.before_url} ({t.before_page_type or '?'}) -> "
+                f"{t.after_url} ({t.after_page_type or '?'}) "
+                f"[{t.transition_type}]{api_desc}"
+            )
+
+        existing_names = [f.name for f in existing_flows]
+        page_lines = []
+        for page in pages[:60]:
+            if not page.url or page.url.startswith("__summary_page_"):
+                continue
+            page_lines.append(
+                f"  - {page.url} | type={page.page_type or '?'} | title={page.title or '?'} | "
+                f"purpose={page.purpose or '?'} | elements={', '.join(page.key_elements[:8])} | "
+                f"actions={', '.join(page.actions[:6])} | forms={len(page.forms)}"
+            )
+
+        prompt = f"""Analyze these browser interaction transitions and identify ALL distinct user flows.
+
+## Transitions Recorded
+{chr(10).join(transition_lines) if transition_lines else "No structured transitions were parsed."}
+
+## Pages Observed
+{chr(10).join(page_lines) if page_lines else "No page records were parsed."}
+
+## Already Identified Flows
+{json.dumps(existing_names) if existing_names else "None"}
+
+## Task
+Identify user flows (sequences of related actions that accomplish a task) from the transitions above.
+Do NOT repeat flows already identified. Look for:
+- Authentication flows (login, logout, registration)
+- Form submissions (filling fields + submit)
+- Navigation patterns (browsing through sections)
+- Search flows (entering query + viewing results)
+- CRUD operations (create, read, update, delete)
+- Page capability flows when a page record shows a distinct purpose, form, search/filter control, or important action
+- Any other meaningful user journeys
+Return at least {min_expected} total flows when the page/transition evidence supports that many distinct journeys.
+
+## Output Format
+Return ONLY a JSON array of flow objects. No other text.
+
+```json
+[
+  {{
+    "name": "Flow Name",
+    "category": "authentication|crud|navigation|form_submission|search|settings",
+    "steps": [
+      {{"action": "fill", "element": "Element Name", "value": "value"}},
+      {{"action": "click", "element": "Button Name"}}
+    ],
+    "startUrl": "/start-page",
+    "endUrl": "/end-page",
+    "outcome": "What the flow accomplishes",
+    "isSuccessPath": true,
+    "preconditions": ["Required state before flow"],
+    "postconditions": ["State after flow completes"]
+  }}
+]
+```
+"""
+
+        try:
+            runner = AgentRunner(
+                timeout_seconds=120,
+                allowed_tools=[],  # No tools needed - pure text analysis
+                log_tools=False,
+                session_dir=None,
+                model_tier="standard",
+            )
+
+            result = await runner.run(prompt)
+
+            if not result.success or not result.output:
+                return []
+
+            # Parse the response - try extract_json_from_markdown first
+            flow_data = None
+            try:
+                flow_data = extract_json_from_markdown(result.output)
+                # If it returned a dict, might be wrapped
+                if isinstance(flow_data, dict) and "flows" in flow_data:
+                    flow_data = flow_data["flows"]
+                elif isinstance(flow_data, dict):
+                    flow_data = [flow_data]
+            except (ValueError, json.JSONDecodeError):
+                pass
+
+            # Fallback: try to find a JSON array in the output
+            if not flow_data:
+                array_match = re.search(r"\[[\s\S]*\]", result.output)
+                if array_match:
+                    try:
+                        flow_data = json.loads(array_match.group(0))
+                    except json.JSONDecodeError:
+                        pass
+
+            if not flow_data or not isinstance(flow_data, list):
+                return []
+
+            # Convert to FlowRecord objects
+            synthesized = []
+            for f in flow_data:
+                if not isinstance(f, dict):
+                    continue
+                name = f.get("name", "Unnamed Flow")
+                if not name.endswith("(synthesized)"):
+                    name = f"{name} (synthesized)"
+                flow = FlowRecord(
+                    name=name,
+                    category=f.get("category", "unknown"),
+                    steps=f.get("steps", []),
+                    start_url=f.get("startUrl", ""),
+                    end_url=f.get("endUrl", ""),
+                    outcome=f.get("outcome", ""),
+                    is_success_path=f.get("isSuccessPath", True),
+                    preconditions=f.get("preconditions", []),
+                    postconditions=f.get("postconditions", []),
+                )
+                synthesized.append(flow)
+
+            return self._deduplicate_flows(synthesized)
+
+        except Exception as e:
+            logger.warning(f"   Flow synthesis pass failed: {e}")
+            return []
+
+    async def _run_text_flow_synthesis(
+        self,
+        raw_output: str,
+        session_dir: Path,
+    ) -> list[FlowRecord]:
+        """Extract flows from raw prose output when no structured JSON was parsed.
+
+        This is a fallback for when the agent produced descriptive text but
+        didn't emit properly formatted JSON transition/flow records.
+        """
+        # Truncate to avoid token limits — use last portion (most likely has summary info)
+        max_chars = 8000
+        text_excerpt = (
+            raw_output[-max_chars:] if len(raw_output) > max_chars else raw_output
+        )
+
+        prompt = f"""Analyze this browser exploration output and identify ALL user flows the agent performed.
+
+## Raw Exploration Output (excerpt)
+{text_excerpt}
+
+## Task
+Extract any user flows (sequences of related actions that accomplish a task) from the text above.
+Look for descriptions of:
+- Pages visited and navigation between them
+- Forms filled and submitted
+- Buttons clicked and their results
+- Authentication attempts
+- Search interactions
+- Any multi-step user journey
+
+## Output Format
+Return ONLY a JSON array of flow objects. No other text.
+
+```json
+[
+  {{
+    "name": "Flow Name",
+    "category": "authentication|crud|navigation|form_submission|search|settings",
+    "steps": [
+      {{"action": "navigate", "element": "page", "value": "URL"}},
+      {{"action": "click", "element": "Button Name"}}
+    ],
+    "startUrl": "/start-page",
+    "endUrl": "/end-page",
+    "outcome": "What the flow accomplishes",
+    "isSuccessPath": true,
+    "preconditions": [],
+    "postconditions": []
+  }}
+]
+```
+"""
+
+        try:
+            runner = AgentRunner(
+                timeout_seconds=120,
+                allowed_tools=[],
+                log_tools=False,
+                session_dir=None,
+                model_tier="standard",
+            )
+
+            result = await runner.run(prompt)
+            if not result.success or not result.output:
+                return []
+
+            # Parse the response
+            flow_data = None
+            try:
+                flow_data = extract_json_from_markdown(result.output)
+                if isinstance(flow_data, dict) and "flows" in flow_data:
+                    flow_data = flow_data["flows"]
+                elif isinstance(flow_data, dict):
+                    flow_data = [flow_data]
+            except (ValueError, json.JSONDecodeError):
+                pass
+
+            if not flow_data:
+                array_match = re.search(r"\[[\s\S]*\]", result.output)
+                if array_match:
+                    try:
+                        flow_data = json.loads(array_match.group(0))
+                    except json.JSONDecodeError:
+                        pass
+
+            if not flow_data or not isinstance(flow_data, list):
+                return []
+
+            synthesized = []
+            for f in flow_data:
+                if not isinstance(f, dict):
+                    continue
+                name = f.get("name", "Unnamed Flow")
+                if not name.endswith("(synthesized)"):
+                    name = f"{name} (synthesized)"
+                flow = FlowRecord(
+                    name=name,
+                    category=f.get("category", "unknown"),
+                    steps=f.get("steps", []),
+                    start_url=f.get("startUrl", ""),
+                    end_url=f.get("endUrl", ""),
+                    outcome=f.get("outcome", ""),
+                    is_success_path=f.get("isSuccessPath", True),
+                    preconditions=f.get("preconditions", []),
+                    postconditions=f.get("postconditions", []),
+                )
+                synthesized.append(flow)
+
+            return self._deduplicate_flows(synthesized)
+
+        except Exception as e:
+            logger.warning(f"   Text flow synthesis failed: {e}")
+            return []
+
+    async def _run_ai_json_recovery(
+        self,
+        raw_output: str,
+        session_dir: Path,
+    ) -> list[dict]:
+        """Use AI to extract structured JSON objects from raw exploration output.
+
+        Called when regex-based extraction (Strategies 1-3) found zero objects.
+        Processes the FULL output without truncation by chunking with overlap.
+
+        Returns a list of dicts with keys like "transition", "flow", "issue", "summary".
+        """
+        if not raw_output or len(raw_output) < 200:
+            return []
+
+        CHUNK_SIZE = 25000  # chars per chunk (~8k tokens)
+        OVERLAP = 3000  # overlap to avoid splitting JSON at boundaries
+
+        # Build chunks covering the entire output
+        chunks = []
+        if len(raw_output) <= CHUNK_SIZE:
+            chunks = [raw_output]
+        else:
+            pos = 0
+            while pos < len(raw_output):
+                end = min(pos + CHUNK_SIZE, len(raw_output))
+                chunks.append(raw_output[pos:end])
+                pos = end - OVERLAP
+                if pos >= len(raw_output):
+                    break
+
+        logger.info(
+            f"   AI JSON recovery: processing {len(raw_output)} chars in {len(chunks)} chunk(s)"
+        )
+
+        all_recovered = []
+        seen_json = set()
+
+        for i, chunk in enumerate(chunks):
+            chunk_label = (
+                f"chunk {i + 1}/{len(chunks)}" if len(chunks) > 1 else "full output"
+            )
+
+            prompt = f"""You are a JSON extraction specialist. The following text is output from a browser exploration agent that was supposed to emit structured JSON records but may have formatted them incorrectly, used wrong casing, or embedded them in prose text.
+
+## Your Task
+Extract ALL structured JSON objects from the text below. Look for:
+1. **Transition records**: Objects with a "transition" key containing action, before, after, transitionType, apiCalls
+2. **Flow records**: Objects with a "flow" key containing name, category, steps, startUrl, endUrl, outcome
+3. **Page records**: Objects with a "page" key containing url, title, pageType, purpose, keyElements, forms, actions, links
+4. **Issue records**: Objects with an "issue" key containing type, severity, url, description
+5. **Summary records**: Objects with a "summary" key containing pagesDiscovered, flowsDiscovered, etc.
+
+## Rules
+- Extract EVERY instance you find, even if the JSON is malformed — fix the structure
+- If the agent described browser actions in prose but did NOT emit JSON, CREATE the appropriate transition and flow JSON records from those descriptions
+- Use lowercase top-level keys: "transition", "flow", "issue", "summary"
+- Preserve all nested data exactly as found (URLs, element names, API calls, steps)
+- Output ONLY a JSON array of objects, no other text before or after
+- If you find absolutely nothing extractable, output: []
+
+## Expected JSON Structures
+
+Transition: {{"transition": {{"sequence": 1, "action": {{"type": "click", "element": {{"ref": "...", "role": "button", "name": "Submit"}}, "value": null}}, "before": {{"url": "...", "pageType": "...", "keyElements": [...]}}, "after": {{"url": "...", "pageType": "...", "keyElements": [...], "changes": [...]}}, "transitionType": "navigation", "apiCalls": [...]}}}}
+
+Flow: {{"flow": {{"name": "...", "category": "authentication|crud|navigation|form_submission|search", "steps": [...], "startUrl": "...", "endUrl": "...", "outcome": "...", "isSuccessPath": true, "preconditions": [...], "postconditions": [...]}}}}
+
+Page: {{"page": {{"url": "...", "title": "...", "pageType": "...", "purpose": "...", "keyElements": [...], "forms": [...], "actions": [...], "links": [...]}}}}
+
+Issue: {{"issue": {{"type": "broken_link|error_page|accessibility|performance|usability|security|missing_content", "severity": "critical|high|medium|low", "url": "...", "description": "..."}}}}
+
+Summary: {{"summary": {{"pagesDiscovered": 10, "flowsDiscovered": 5, "elementsInteracted": 47, "apiEndpointsFound": 12, "issuesFound": 2, "status": "completed"}}}}
+
+## Exploration Output ({chunk_label}, {len(chunk)} chars)
+{chunk}
+"""
+
+            try:
+                runner = AgentRunner(
+                    timeout_seconds=180,
+                    allowed_tools=[],  # Pure text analysis
+                    log_tools=False,
+                    session_dir=None,
+                    model_tier="standard",
+                )
+
+                result = await runner.run(prompt)
+
+                if not result.success or not result.output:
+                    logger.warning(f"   AI JSON recovery {chunk_label}: no output")
+                    continue
+
+                # Parse AI response
+                recovered = None
+                try:
+                    recovered = extract_json_from_markdown(result.output)
+                    if isinstance(recovered, dict):
+                        recovered = [recovered]
+                except (ValueError, json.JSONDecodeError):
+                    pass
+
+                if not recovered:
+                    array_match = re.search(r"\[[\s\S]*\]", result.output)
+                    if array_match:
+                        try:
+                            recovered = json.loads(array_match.group(0))
+                        except json.JSONDecodeError:
+                            pass
+
+                if recovered and isinstance(recovered, list):
+                    chunk_count = 0
+                    for obj in recovered:
+                        if isinstance(obj, dict):
+                            # Normalize top-level keys to lowercase
+                            normalized = {k.lower(): v for k, v in obj.items()}
+                            key = json.dumps(normalized, sort_keys=True)
+                            if key not in seen_json:
+                                seen_json.add(key)
+                                all_recovered.append(normalized)
+                                chunk_count += 1
+                    logger.info(
+                        f"   AI JSON recovery {chunk_label}: extracted {chunk_count} objects"
+                    )
+                else:
+                    logger.warning(
+                        f"   AI JSON recovery {chunk_label}: could not parse response"
+                    )
+
+            except Exception as e:
+                logger.warning(f"   AI JSON recovery {chunk_label} failed: {e}")
+                continue
+
+        logger.info(f"   AI JSON recovery total: {len(all_recovered)} unique objects")
+        return all_recovered
+
+    def _classify_segment(self, segment: list[TransitionRecord]) -> FlowRecord | None:
+        """Classify a segment of transitions into a flow archetype.
+
+        Returns a FlowRecord or None if no pattern matches.
+        """
+        actions = [t.action_type.lower() for t in segment]
+        urls = [t.before_url.lower() for t in segment] + [segment[-1].after_url.lower()]
+        all_elements = []
+        for t in segment:
+            elem = self._normalize_action_element(t.action_element)
+            all_elements.append(elem.get("name", "").lower())
+        api_methods = []
+        for t in segment:
+            for api in self._normalize_api_calls(t.api_calls):
+                api_methods.append(api.get("method", "").upper())
+
+        start_url = segment[0].before_url
+        end_url = segment[-1].after_url
+
+        # Build steps from transitions
+        steps = []
+        for t in segment:
+            elem = self._normalize_action_element(t.action_element)
+            step = {
+                "action": t.action_type,
+                "element": elem.get("name", "unknown"),
+            }
+            if t.action_value:
+                step["value"] = t.action_value
+            steps.append(step)
+
+        # Pattern: Authentication flow
+        auth_keywords = [
+            "login",
+            "sign in",
+            "signin",
+            "auth",
+            "password",
+            "email",
+            "username",
+        ]
+        has_fill = actions.count("fill") >= 1
+        has_auth_url = any(
+            kw in url for url in urls for kw in ["login", "auth", "signin", "sign-in"]
+        )
+        has_auth_element = any(
+            kw in elem for elem in all_elements for kw in auth_keywords
+        )
+        has_post = "POST" in api_methods
+
+        if has_fill and (has_auth_url or has_auth_element) and has_post:
+            return FlowRecord(
+                name="Authentication Flow (inferred)",
+                category="authentication",
+                steps=steps,
+                start_url=start_url,
+                end_url=end_url,
+                outcome=f"User navigated from {start_url} to {end_url}",
+                is_success_path=True,
+                preconditions=["User not authenticated"],
+                postconditions=["User authenticated"],
+            )
+
+        # Pattern: Form submission (2+ fills followed by click/submit)
+        fill_count = actions.count("fill")
+        has_click = "click" in actions
+        if fill_count >= 2 and has_click:
+            # Determine form type from element names
+            form_elements = [
+                e for e, a in zip(all_elements, actions) if a == "fill" and e
+            ]
+            form_name = "Form Submission"
+            if form_elements:
+                # Use first meaningful element name for context
+                form_name = f"{form_elements[0].title()} Form Submission"
+
+            return FlowRecord(
+                name=f"{form_name} (inferred)",
+                category="form_submission",
+                steps=steps,
+                start_url=start_url,
+                end_url=end_url,
+                outcome=f"Form submitted with {fill_count} fields",
+                is_success_path=True,
+                preconditions=[],
+                postconditions=[],
+            )
+
+        # Pattern: Search (fill into search-like element + navigation/update)
+        search_keywords = ["search", "query", "find", "filter"]
+        has_search_element = any(
+            kw in elem for elem in all_elements for kw in search_keywords
+        )
+        if has_fill and has_search_element:
+            return FlowRecord(
+                name="Search Flow (inferred)",
+                category="search",
+                steps=steps,
+                start_url=start_url,
+                end_url=end_url,
+                outcome="Search performed and results displayed",
+                is_success_path=True,
+                preconditions=[],
+                postconditions=["Search results visible"],
+            )
+
+        # Pattern: Navigation flow (2+ navigation transitions across different pages)
+        unique_urls = set(urls)
+        nav_transitions = sum(1 for t in segment if t.transition_type == "navigation")
+        if nav_transitions >= 2 and len(unique_urls) >= 3:
+            return FlowRecord(
+                name=f"Navigation: {segment[0].before_page_type or 'page'} to {segment[-1].after_page_type or 'page'} (inferred)",
+                category="navigation",
+                steps=steps,
+                start_url=start_url,
+                end_url=end_url,
+                outcome=f"Navigated through {len(unique_urls)} pages",
+                is_success_path=True,
+                preconditions=[],
+                postconditions=[],
+            )
+
+        # Pattern: Generic interaction flow (fallback for 3+ diverse actions)
+        if len(segment) >= 3 and len(set(actions)) >= 2:
+            return FlowRecord(
+                name=f"User Interaction: {segment[0].before_page_type or 'page'} (inferred)",
+                category="navigation",
+                steps=steps,
+                start_url=start_url,
+                end_url=end_url,
+                outcome=f"Completed {len(segment)} interactions",
+                is_success_path=True,
+                preconditions=[],
+                postconditions=[],
+            )
+
+        return None
+
+    def _save_results(self, result: ExplorationResult, session_dir: Path):
+        """Save exploration results to files."""
+
+        # Save transitions
+        transitions_data = []
+        for t in result.transitions:
+            transitions_data.append(
+                {
+                    "sequence": t.sequence,
+                    "sourceType": result.provenance_source,
+                    "confidence": (
+                        result.quality_score / 100 if result.quality_score else 0
+                    ),
+                    "action": {
+                        "type": t.action_type,
+                        "element": t.action_element,
+                        "value": t.action_value,
+                    },
+                    "before": {
+                        "url": t.before_url,
+                        "pageType": t.before_page_type,
+                        "keyElements": t.before_elements,
+                    },
+                    "after": {
+                        "url": t.after_url,
+                        "pageType": t.after_page_type,
+                        "keyElements": t.after_elements,
+                    },
+                    "transitionType": t.transition_type,
+                    "apiCalls": t.api_calls,
+                    "changes": t.changes_description,
+                }
+            )
+        (session_dir / "transitions.json").write_text(
+            json.dumps(transitions_data, indent=2)
+        )
+
+        # Save flows
+        flows_data = []
+        for f in result.flows:
+            flows_data.append(
+                {
+                    "name": f.name,
+                    "sourceType": result.provenance_source,
+                    "confidence": (
+                        result.quality_score / 100 if result.quality_score else 0
+                    ),
+                    "category": f.category,
+                    "steps": f.steps,
+                    "startUrl": f.start_url,
+                    "endUrl": f.end_url,
+                    "outcome": f.outcome,
+                    "isSuccessPath": f.is_success_path,
+                    "preconditions": f.preconditions,
+                    "postconditions": f.postconditions,
+                }
+            )
+        (session_dir / "flows.json").write_text(json.dumps(flows_data, indent=2))
+
+        # Save pages
+        pages_data = []
+        for p in result.pages:
+            pages_data.append(
+                {
+                    "url": p.url,
+                    "title": p.title,
+                    "pageType": p.page_type,
+                    "purpose": p.purpose,
+                    "keyElements": p.key_elements,
+                    "forms": p.forms,
+                    "actions": p.actions,
+                    "links": p.links,
+                    "sourceType": result.provenance_source,
+                    "confidence": (
+                        result.quality_score / 100 if result.quality_score else 0
+                    ),
+                }
+            )
+        (session_dir / "pages.json").write_text(json.dumps(pages_data, indent=2))
+
+        # Save API endpoints
+        (session_dir / "api_endpoints.json").write_text(
+            json.dumps(result.api_endpoints, indent=2)
+        )
+
+        # Save issues
+        issues_data = []
+        for iss in result.issues:
+            issues_data.append(
+                {
+                    "type": iss.issue_type,
+                    "severity": iss.severity,
+                    "url": iss.url,
+                    "description": iss.description,
+                    "element": iss.element,
+                    "evidence": iss.evidence,
+                }
+            )
+        (session_dir / "issues.json").write_text(json.dumps(issues_data, indent=2))
+
+        # Save summary
+        summary = {
+            "sessionId": result.session_id,
+            "entryUrl": result.entry_url,
+            "status": result.status,
+            "pagesDiscovered": result.pages_discovered,
+            "flowsDiscovered": len(result.flows),
+            "transitionsRecorded": len(result.transitions),
+            "apiEndpointsFound": len(result.api_endpoints),
+            "issuesFound": len(result.issues),
+            "elementsDiscovered": result.elements_discovered,
+            "durationSeconds": result.duration_seconds,
+            "errorMessage": result.error_message,
+            "sourceType": result.provenance_source,
+            "qualityScore": result.quality_score,
+            "quality": result.quality_summary,
+            "validation": result.validation_summary,
+            "prompt": result.prompt_metadata,
+            "agentStats": self._last_agent_stats,
+        }
+        (session_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+
+async def run_exploration(
+    entry_url: str,
+    project_id: str = "default",
+    session_id: str | None = None,
+    max_interactions: int = 50,
+    max_depth: int = 10,
+    strategy: str = "goal_directed",
+    timeout_minutes: int = 30,
+    credentials: dict[str, str] | None = None,
+    login_url: str | None = None,
+    exclude_patterns: list[str] | None = None,
+    focus_areas: list[str] | None = None,
+    additional_instructions: str | None = None,
+) -> ExplorationResult:
+    """
+    Convenience function to run an exploration.
+
+    Args:
+        entry_url: URL to start exploration from
+        project_id: Project ID for isolation
+        session_id: Optional session ID
+        max_interactions: Maximum number of interactions
+        max_depth: Maximum navigation depth
+        strategy: Exploration strategy (goal_directed, breadth_first, depth_first)
+        timeout_minutes: Maximum exploration time
+        credentials: Login credentials (dict with username, password, username_var, password_var)
+        login_url: Login page URL
+        exclude_patterns: URL patterns to skip
+        focus_areas: Areas to prioritize
+
+    Returns:
+        ExplorationResult with all discovered data
+    """
+    config = ExplorationConfig(
+        entry_url=entry_url,
+        max_interactions=max_interactions,
+        max_depth=max_depth,
+        strategy=strategy,
+        timeout_minutes=timeout_minutes,
+        credentials=credentials,
+        login_url=login_url,
+        exclude_patterns=exclude_patterns or [],
+        focus_areas=focus_areas or [],
+        additional_instructions=additional_instructions,
+    )
+
+    explorer = AppExplorer(project_id=project_id)
+    return await explorer.explore(config, session_id)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AI-Powered App Exploration")
+    parser.add_argument("url", help="Entry URL to explore")
+    parser.add_argument("--project", default="default", help="Project ID")
+    parser.add_argument(
+        "--session-id", help="Session ID (auto-generated if not provided)"
+    )
+    parser.add_argument(
+        "--max-interactions", type=int, default=50, help="Maximum interactions"
+    )
+    parser.add_argument(
+        "--max-depth", type=int, default=10, help="Maximum navigation depth"
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=["goal_directed", "breadth_first", "depth_first", "api_focused"],
+        default="goal_directed",
+        help="Exploration strategy",
+    )
+    parser.add_argument("--timeout", type=int, default=30, help="Timeout in minutes")
+    parser.add_argument("--login-url", help="Login page URL if different from entry")
+    parser.add_argument(
+        "--exclude", action="append", default=[], help="URL patterns to exclude"
+    )
+    parser.add_argument(
+        "--focus", action="append", default=[], help="Areas to prioritize"
+    )
+
+    args = parser.parse_args()
+
+    # Check for credentials in environment
+    credentials = None
+    if os.environ.get("LOGIN_USERNAME") or os.environ.get("LOGIN_EMAIL"):
+        username_var = (
+            "LOGIN_EMAIL" if os.environ.get("LOGIN_EMAIL") else "LOGIN_USERNAME"
+        )
+        password_var = "LOGIN_PASSWORD"
+        credentials = {
+            "username": os.environ.get(username_var, ""),
+            "password": os.environ.get(password_var, ""),
+            "username_var": username_var,
+            "password_var": password_var,
+        }
+
+    async def main():
+        result = await run_exploration(
+            entry_url=args.url,
+            project_id=args.project,
+            session_id=args.session_id,
+            max_interactions=args.max_interactions,
+            max_depth=args.max_depth,
+            strategy=args.strategy,
+            timeout_minutes=args.timeout,
+            credentials=credentials,
+            login_url=args.login_url,
+            exclude_patterns=args.exclude,
+            focus_areas=args.focus,
+        )
+
+        logger.info(f"Exploration Result: {result.status}")
+        if result.error_message:
+            logger.error(f"Error: {result.error_message}")
+
+    try:
+        from orchestrator.logging_config import setup_logging
+
+        setup_logging()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Exploration stopped by user")
+    except Exception as e:
+        if "cancel scope" in str(e).lower():
+            pass
+        else:
+            raise

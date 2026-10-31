@@ -1,0 +1,199 @@
+SentinelQA - Hackathon Setup and Requirement Checklist
+====================================================
+
+This file is for outside-of-VS-Code setup and deployment.
+
+1) What this project is solving
+------------------------------
+This project matches the problem statement for an autonomous UI testing system:
+- reads acceptance criteria from a ticket source (Jira-ready integration exists)
+- generates Playwright tests automatically
+- runs the generated tests against a demo target
+- repairs broken selectors when UI changes
+- shows pass/fail results and repair logs
+- supports reporting and dashboard-based QA workflows
+
+Minimum required items covered by this repo:
+- Ticket Input: Jira integration API exists in orchestrator/api/jira.py
+- Test Generation: Playwright generation flow exists in orchestrator/cli.py and docs in README.md
+- Test Execution: project supports running generated Playwright tests against demo apps
+- Self-Healing: docs and pipelines include native/healing logic and retry logic
+- Report: dashboard and runtime reporting are part of the app
+
+2) Core app status
+------------------
+Verified live in this workspace:
+- Frontend: http://localhost:3000  -> page title shows SentinelQA
+- Backend Swagger: http://localhost:8001/docs -> FastAPI docs are live
+
+3) Required environment setup
+-----------------------------
+Windows example (PowerShell):
+
+1. Install these tools:
+   - Python 3.10+ or 3.11+
+   - Node.js 18+ or 20+
+   - Git
+   - Optional: Docker Desktop if you want container mode
+
+2. Open PowerShell in the project folder:
+   cd "C:\Users\Karan Mehra\Downloads\quorvex_ai-main (1)\quorvex_ai-main"
+
+3. Create a virtual environment:
+   py -3.11 -m venv venv
+   .\venv\Scripts\Activate.ps1
+
+4. Install Python packages:
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.freeze
+
+5. Install Node dependencies for the frontend:
+   cd web
+   npm install
+   cd ..
+
+6. Copy environment template:
+   copy .env.example .env
+
+7. Fill .env with real values. Do not leave placeholders.
+
+Required keys to set:
+- QUORVEX_LLM_API_KEY
+- QUORVEX_LLM_BASE_URL
+- ANTHROPIC_BASE_URL
+- ANTHROPIC_MODEL
+- JWT_SECRET_KEY
+- DATABASE_URL (or leave default SQLite for local demo)
+
+Optional but useful:
+- OPENAI_API_KEY for memory/embeddings
+- MINIO_ROOT_USER and MINIO_ROOT_PASSWORD if you use MinIO
+- JIRA credentials if connecting to real Jira
+
+8. Example values for a local demo:
+   QUORVEX_LLM_PROVIDER=anthropic_compatible
+   QUORVEX_LLM_API_KEY=your-api-key-here
+   QUORVEX_LLM_BASE_URL=https://api.z.ai/api/anthropic
+   ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
+   ANTHROPIC_MODEL=glm-5.1
+   JWT_SECRET_KEY=dev-secret-key-change-in-production
+   DATABASE_URL=sqlite:///./test.db
+
+9. Start backend:
+   .\venv\Scripts\Activate.ps1
+   python -m uvicorn orchestrator.api.main:app --host 0.0.0.0 --port 8001
+
+10. Start frontend:
+    cd web
+    $env:Path += ';C:\Program Files\nodejs'
+    npm run dev -- --hostname 0.0.0.0 --port 3000
+
+11. Open:
+    http://localhost:3000
+    http://localhost:8001/docs
+
+4) API keys and credentials required
+------------------------------------
+Mandatory for AI generation flows:
+- QUORVEX_LLM_API_KEY
+- QUORVEX_LLM_BASE_URL
+- ANTHROPIC_BASE_URL
+- ANTHROPIC_MODEL
+
+If using Jira:
+- Jira base URL
+- Jira email
+- Jira API token
+- project key
+
+If using memory/embeddings:
+- OPENAI_API_KEY
+
+Security reminder:
+- never commit real API keys to Git
+- use a .env file only on your local machine
+- do not expose tokens in screenshots or demo videos
+
+5) Deployment to Netlify or Vercel
+----------------------------------
+Frontend deployment:
+- Deploy the web/ app to Netlify or Vercel.
+- Set environment variable:
+  NEXT_PUBLIC_API_URL=https://your-backend-url
+
+Backend deployment:
+- Deploy Python FastAPI backend to Render, Railway, Fly.io, Azure App Service, or a VPS.
+- Set the same env vars there.
+- Expose the backend on HTTPS.
+- Update the frontend API URL to the deployed backend host.
+
+Important:
+- Netlify/Vercel host the frontend only.
+- The backend should not live inside the frontend project for a production deployment.
+
+6) Requirement-by-requirement validation
+----------------------------------------
+Requirement: Ticket Input from Jira / mock ticket
+Status: Covered
+Notes: Jira integration exists in orchestrator/api/jira.py. Mock ticket flow is acceptable when Jira access is unavailable.
+
+Requirement: Test generation from acceptance criteria
+Status: Covered
+Notes: CLI and spec-based generation exist in orchestrator/cli.py and docs.
+
+Requirement: Run generated test against demo app
+Status: Covered
+Notes: Playwright support exists and the repo includes test execution patterns.
+
+Requirement: Self-healing when element changes
+Status: Covered
+Notes: healer / retry logic is part of the architecture and docs.
+
+Requirement: Report pass/fail/repair results
+Status: Covered
+Notes: dashboard and generated report flows are part of the project.
+
+Bonus Goal: Update Jira with results
+Status: Optional / supported by integration
+Notes: Jira API endpoints exist; requires a configured Jira project and valid credentials.
+
+Bonus Goal: Visual checks / screenshots
+Status: Optional / supported by project architecture
+Notes: Browser tracing and artifact capture are part of the stack.
+
+Bonus Goal: Flaky test detection
+Status: Optional / supported by architecture
+Notes: CI, pass-rate, and regression tracking features are included in docs.
+
+7) Recommended hackathon flow
+-----------------------------
+- Use a mock Jira ticket or a simple acceptance-criteria markdown file
+- Generate a Playwright spec from that ticket
+- Run against the demo app
+- Force a selector change to test self-healing
+- Capture pass/fail + fix log
+- Show the report in the dashboard
+
+8) Final demo advice
+--------------------
+- Keep the AI credentials in .env and do not expose them in code
+- Use a simple demo site for the live showcase
+- Show the generated test, the repaired locator, and the final pass report
+- Keep the explanation simple: "Ticket in -> script generated -> test runs -> selector fixed -> result reported"
+
+9) Useful commands
+------------------
+Backend:
+  python -m uvicorn orchestrator.api.main:app --host 0.0.0.0 --port 8001
+
+Frontend:
+  cd web
+  npm install
+  npm run dev -- --hostname 0.0.0.0 --port 3000
+
+Generate test flow (example):
+  python orchestrator/cli.py specs/your-test.md
+
+10) Last reminder
+-----------------
+If you do not have real Jira or provider keys, use a mock ticket and demo app. That still satisfies the problem statement as a minimum working version.

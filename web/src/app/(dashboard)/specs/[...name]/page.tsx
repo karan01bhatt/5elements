@@ -1,0 +1,681 @@
+'use client';
+import { useState, useEffect, useMemo } from 'react';
+import type { CSSProperties } from 'react';
+import { ArrowLeft, Database, Edit, Save, Play, Code, FileText, Eye, X } from 'lucide-react';
+import Link from 'next/link';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
+import SpecBuilder from '@/components/SpecBuilder';
+import { TestDataPicker } from '@/components/TestDataPicker';
+import CodeEditor from '@/components/CodeEditor';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { useProject } from '@/contexts/ProjectContext';
+import { useProjectRole } from '@/hooks/useProjectRole';
+import { API_BASE } from '@/lib/api';
+import type { BrowserAuthSession } from '@/lib/browser-auth-sessions';
+import {
+    browserAuthSessionLabel,
+    fetchProjectBrowserAuthSessions,
+    isBrowserAuthSessionSelectable,
+} from '@/lib/browser-auth-sessions';
+import { PageLayout } from '@/components/ui/page-layout';
+import { PageHeader } from '@/components/ui/page-header';
+
+function extractDisplayTitle(fullPath: string): { title: string; folder: string } {
+    const parts = fullPath.split('/');
+    const filename = parts[parts.length - 1];
+    const folder = parts.length > 1 ? parts.slice(0, -1).join(' / ') : '';
+    const title = filename
+        .replace(/\.md$/i, '')
+        .replace(/-/g, ' ')
+        .replace(/\b(tc)\b/gi, 'TC')
+        .replace(/\b\w/g, c => c.toUpperCase());
+    return { title, folder };
+}
+
+function getSpecNameCandidates(name: string): string[] {
+    const trimmed = name.trim();
+    if (!trimmed) return [];
+    if (trimmed.endsWith('.md')) return [trimmed];
+    return [trimmed, `${trimmed}.md`];
+}
+
+type SpecsBrowserAuthMode = 'project_default' | 'session' | 'none';
+
+function specsBrowserAuthRequestBody(mode: SpecsBrowserAuthMode, sessionId: string) {
+    if (mode === 'session') return { browser_auth_session_id: sessionId };
+    if (mode === 'project_default') return { use_project_default_browser_auth: true };
+    return {};
+}
+
+function segmentedControlStyle(): CSSProperties {
+    return {
+        background: 'var(--background-raised)',
+        borderRadius: 'var(--radius)',
+        padding: '3px',
+        display: 'flex',
+        border: '1px solid var(--border)',
+        gap: '2px',
+        flexWrap: 'wrap',
+    };
+}
+
+function segmentButtonStyle(active: boolean): CSSProperties {
+    return {
+        minHeight: 32,
+        padding: '0.35rem 0.75rem',
+        background: active ? 'var(--primary)' : 'transparent',
+        color: active ? 'white' : 'var(--text-secondary)',
+        borderRadius: 'var(--radius-sm)',
+        border: 'none',
+        fontSize: '0.8rem',
+        fontWeight: active ? 600 : 500,
+        cursor: 'pointer',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '0.375rem',
+        whiteSpace: 'nowrap',
+    };
+}
+
+const toolbarGroupStyle: CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.75rem',
+    flexWrap: 'wrap',
+};
+
+const contentTabBarStyle: CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    marginBottom: '0.75rem',
+};
+
+const editorHeaderStyle: CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '0.75rem',
+    padding: '0.75rem 1rem',
+    borderBottom: '1px solid var(--border)',
+    background: 'var(--surface)',
+    flexWrap: 'wrap',
+};
+
+const editorHeaderActionsStyle: CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: '0.5rem',
+    flexWrap: 'wrap',
+    marginLeft: 'auto',
+};
+
+const testDataPanelStyle: CSSProperties = {
+    padding: '0.75rem 1rem',
+    borderBottom: '1px solid var(--border)',
+    background: 'var(--background-raised)',
+};
+
+export default function SpecDetailPage() {
+    const params = useParams();
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const { currentProject } = useProject();
+    const { canEdit: canEditProject } = useProjectRole(currentProject?.id ?? null);
+    const canEdit = !currentProject?.id || canEditProject;
+
+    const nameParam = params?.name;
+    const rawName = Array.isArray(nameParam) ? nameParam.join('/') : (nameParam as string);
+    const decodedName = decodeURIComponent(rawName || '');
+
+    const projectParam = currentProject?.id ? `?project_id=${encodeURIComponent(currentProject.id)}` : '';
+
+    const [content, setContent] = useState('');
+    const [originalContent, setOriginalContent] = useState('');
+    const [resolvedSpecName, setResolvedSpecName] = useState('');
+    const [loadError, setLoadError] = useState<string | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [saving, setSaving] = useState(false);
+    const [isEditing, setIsEditing] = useState(false);
+    const [mode, setMode] = useState<'code' | 'visual'>('code');
+    const [showTestDataPanel, setShowTestDataPanel] = useState(false);
+
+    const [activeTab, setActiveTab] = useState<'spec' | 'generated'>(searchParams.get('tab') === 'generated' ? 'generated' : 'spec');
+    const [isAutomated, setIsAutomated] = useState(false);
+    const [codePath, setCodePath] = useState<string | null>(null);
+    const [generatedCode, setGeneratedCode] = useState<string | null>(null);
+    const [originalGeneratedCode, setOriginalGeneratedCode] = useState<string | null>(null);
+    const [loadingCode, setLoadingCode] = useState(false);
+    const [savingCode, setSavingCode] = useState(false);
+    const [isEditingCode, setIsEditingCode] = useState(false);
+    const [isRunning, setIsRunning] = useState(false);
+    const [browserAuthSessions, setBrowserAuthSessions] = useState<BrowserAuthSession[]>([]);
+    const [browserAuthMode, setBrowserAuthMode] = useState<SpecsBrowserAuthMode>('none');
+    const [browserAuthSessionId, setBrowserAuthSessionId] = useState('');
+
+    const activeBrowserAuthSessions = useMemo(
+        () => browserAuthSessions.filter(isBrowserAuthSessionSelectable),
+        [browserAuthSessions]
+    );
+    const projectDefaultBrowserAuthSession = useMemo(
+        () => activeBrowserAuthSessions.find(session => session.is_default),
+        [activeBrowserAuthSessions]
+    );
+
+    useEffect(() => {
+        let cancelled = false;
+        if (!currentProject?.id) {
+            setBrowserAuthSessions([]);
+            setBrowserAuthMode('none');
+            setBrowserAuthSessionId('');
+            return;
+        }
+        fetchProjectBrowserAuthSessions(currentProject.id)
+            .then(sessions => {
+                if (cancelled) return;
+                setBrowserAuthSessions(sessions);
+                const defaultSession = sessions.find(session => session.is_default && isBrowserAuthSessionSelectable(session));
+                setBrowserAuthMode(defaultSession ? 'project_default' : 'none');
+                setBrowserAuthSessionId('');
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setBrowserAuthSessions([]);
+                setBrowserAuthMode('none');
+                setBrowserAuthSessionId('');
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [currentProject?.id]);
+
+    const browserAuthSelectValue = browserAuthMode === 'session' ? `session:${browserAuthSessionId}` : browserAuthMode;
+
+    const handleBrowserAuthSelectChange = (value: string) => {
+        if (value.startsWith('session:')) {
+            setBrowserAuthMode('session');
+            setBrowserAuthSessionId(value.slice('session:'.length));
+            return;
+        }
+        setBrowserAuthMode(value as SpecsBrowserAuthMode);
+        setBrowserAuthSessionId('');
+    };
+
+    useEffect(() => {
+        if (!decodedName) return;
+
+        let cancelled = false;
+
+        async function loadSpec() {
+            setLoading(true);
+            setLoadError(null);
+            setContent('');
+            setOriginalContent('');
+            setResolvedSpecName('');
+            setGeneratedCode(null);
+            setOriginalGeneratedCode(null);
+            setCodePath(null);
+            setIsAutomated(false);
+            setShowTestDataPanel(false);
+
+            const candidates = getSpecNameCandidates(decodedName);
+
+            for (const candidate of candidates) {
+                try {
+                    const res = await fetch(`${API_BASE}/specs/${candidate}${projectParam}`);
+                    if (!res.ok) continue;
+                    const data = await res.json();
+                    if (typeof data.content !== 'string') continue;
+
+                    if (cancelled) return;
+                    setContent(data.content);
+                    setOriginalContent(data.content);
+                    setResolvedSpecName(data.name || candidate);
+                    setIsAutomated(data.is_automated || false);
+                    setCodePath(data.code_path || null);
+                    setLoading(false);
+                    return;
+                } catch (err) {
+                    console.error(err);
+                }
+            }
+
+            if (!cancelled) {
+                setLoadError(`Spec not found: ${decodedName}`);
+                setLoading(false);
+            }
+        }
+
+        loadSpec();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [decodedName, projectParam]);
+
+    const activeSpecName = resolvedSpecName || decodedName;
+    const { title: displayTitle, folder } = extractDisplayTitle(activeSpecName);
+
+    const loadGeneratedCode = async () => {
+        if (generatedCode !== null) return;
+        setLoadingCode(true);
+        try {
+            const res = await fetch(`${API_BASE}/specs/${activeSpecName}/generated-code${projectParam}`);
+            if (res.ok) {
+                const data = await res.json();
+                setGeneratedCode(data.content);
+                setOriginalGeneratedCode(data.content);
+                setCodePath(data.code_path);
+            }
+        } catch (e) {
+            console.error('Failed to load generated code');
+        } finally {
+            setLoadingCode(false);
+        }
+    };
+
+    useEffect(() => {
+        const tab = searchParams.get('tab');
+        if ((tab === 'spec' || tab === 'generated') && tab !== activeTab) {
+            setActiveTab(tab);
+        }
+    }, [activeTab, searchParams]);
+
+    useEffect(() => {
+        if (activeTab === 'generated' && isAutomated) {
+            loadGeneratedCode();
+        }
+        if (activeTab !== 'spec') {
+            setShowTestDataPanel(false);
+        }
+    }, [activeTab, isAutomated]);
+
+    const handleCancelSpecEdit = () => {
+        setContent(originalContent);
+        setIsEditing(false);
+        if (mode === 'visual') {
+            setMode('code');
+        }
+    };
+
+    const handleSaveGeneratedCode = async () => {
+        if (!canEdit || !generatedCode) return;
+        setSavingCode(true);
+        try {
+            const res = await fetch(`${API_BASE}/specs/${activeSpecName}/generated-code${projectParam}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: generatedCode })
+            });
+            if (res.ok) {
+                setOriginalGeneratedCode(generatedCode);
+                setIsEditingCode(false);
+            } else {
+                alert('Failed to save generated code');
+            }
+        } catch (e) {
+            alert('Failed to save');
+        } finally {
+            setSavingCode(false);
+        }
+    };
+
+    const handleSave = async () => {
+        if (!canEdit) return;
+        setSaving(true);
+        try {
+            const res = await fetch(`${API_BASE}/specs/${activeSpecName}${projectParam}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            });
+
+            if (res.ok) {
+                setOriginalContent(content);
+                setIsEditing(false);
+                setMode('code');
+            } else {
+                alert('Failed to save');
+            }
+        } catch (e) {
+            alert('Failed to save');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const runTest = async () => {
+        if (!canEdit || isRunning) return;
+
+        setIsRunning(true);
+        try {
+            const res = await fetch(`${API_BASE}/runs`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    spec_name: activeSpecName,
+                    project_id: currentProject?.id,
+                    ...specsBrowserAuthRequestBody(browserAuthMode, browserAuthSessionId)
+                })
+            });
+            const data = await res.json();
+            if (data.id) {
+                router.push('/runs');
+            } else if (!res.ok) {
+                alert(data.detail || 'Failed to start run');
+            }
+        } catch (e) {
+            alert('Failed to start run');
+            setIsRunning(false);
+        }
+    };
+
+    if (loading) return (
+        <PageLayout tier="standard">
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '4rem' }}>
+                <div className="loading-spinner" style={{ width: 40, height: 40 }}></div>
+            </div>
+        </PageLayout>
+    );
+
+    const hasChanges = content !== originalContent;
+
+    if (loadError) return (
+        <PageLayout tier="standard">
+            <PageHeader
+                title={displayTitle}
+                subtitle="Test specification"
+                icon={<FileText size={20} />}
+                breadcrumb={
+                    <Link href="/specs" className="link-hover" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--text-secondary)' }}>
+                        <ArrowLeft size={16} /> Back to Specs
+                    </Link>
+                }
+            />
+            <div className="card-elevated" style={{ padding: '2rem', color: 'var(--text-secondary)' }}>
+                {loadError}
+            </div>
+        </PageLayout>
+    );
+
+    return (
+        <PageLayout tier="standard">
+            <PageHeader
+                title={displayTitle}
+                subtitle={folder || 'Test specification'}
+                icon={<FileText size={20} />}
+                breadcrumb={
+                    <Link href="/specs" className="link-hover" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--text-secondary)' }}>
+                        <ArrowLeft size={16} /> Back to Specs
+                    </Link>
+                }
+                actions={canEdit ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                        <select
+                            aria-label="Browser login session"
+                            value={browserAuthSelectValue}
+                            onChange={event => handleBrowserAuthSelectChange(event.target.value)}
+                            disabled={isRunning}
+                            style={{ minHeight: 38, borderRadius: '6px', border: '1px solid var(--border)', background: 'var(--background)', color: 'var(--text)', padding: '0.45rem 0.6rem', fontSize: '0.85rem' }}
+                        >
+                            <option value="project_default" disabled={!projectDefaultBrowserAuthSession}>
+                                {projectDefaultBrowserAuthSession ? `Project default: ${projectDefaultBrowserAuthSession.name || projectDefaultBrowserAuthSession.id}` : 'Project default unavailable'}
+                            </option>
+                            <option value="none">No auth</option>
+                            {browserAuthSessions.map(session => (
+                                <option key={session.id} value={`session:${session.id}`} disabled={!isBrowserAuthSessionSelectable(session)}>
+                                    {browserAuthSessionLabel(session)}
+                                </option>
+                            ))}
+                        </select>
+                        <button
+                            className="btn btn-primary"
+                            onClick={runTest}
+                            disabled={isRunning}
+                            style={{ opacity: isRunning ? 0.7 : 1, cursor: isRunning ? 'not-allowed' : 'pointer' }}
+                        >
+                            {isRunning ? (
+                                <>
+                                    <span className="loading-spinner" style={{ width: '18px', height: '18px' }}></span>
+                                    Starting...
+                                </>
+                            ) : (
+                                <>
+                                    <Play size={18} /> Run Test
+                                </>
+                            )}
+                        </button>
+                    </div>
+                ) : null}
+            />
+
+            {isAutomated && (
+                <div className="animate-in stagger-2" style={contentTabBarStyle}>
+                    <div style={segmentedControlStyle()} role="tablist" aria-label="Spec detail view">
+                        <button
+                            type="button"
+                            role="tab"
+                            aria-selected={activeTab === 'spec'}
+                            aria-label="Show spec markdown"
+                            onClick={() => setActiveTab('spec')}
+                            style={segmentButtonStyle(activeTab === 'spec')}
+                        >
+                            <FileText size={13} />
+                            Spec
+                        </button>
+                        <button
+                            type="button"
+                            role="tab"
+                            aria-selected={activeTab === 'generated'}
+                            aria-label="Show generated test"
+                            onClick={() => setActiveTab('generated')}
+                            style={segmentButtonStyle(activeTab === 'generated')}
+                        >
+                            <Code size={13} />
+                            Generated Test
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {/* Content area */}
+            <div className="animate-in stagger-3" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: '500px' }}>
+                {activeTab === 'spec' ? (
+                    <div className="card-elevated" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', padding: 0 }}>
+                        <div style={editorHeaderStyle}>
+                            <div style={toolbarGroupStyle}>
+                                <div style={segmentedControlStyle()} role="group" aria-label="Spec editor mode">
+                                    <button
+                                        type="button"
+                                        aria-label="Switch to code editor"
+                                        onClick={() => setMode('code')}
+                                        style={segmentButtonStyle(mode === 'code')}
+                                    >
+                                        <Code size={13} />
+                                        Code
+                                    </button>
+                                    {canEdit && (
+                                        <button
+                                            type="button"
+                                            aria-label="Switch to visual editor"
+                                            onClick={() => { setMode('visual'); setIsEditing(true); }}
+                                            style={segmentButtonStyle(mode === 'visual')}
+                                        >
+                                            <Eye size={13} />
+                                            Visual
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
+                            {canEdit && <div style={editorHeaderActionsStyle}>
+                                <button
+                                    type="button"
+                                    className="btn btn-secondary btn-sm"
+                                    aria-expanded={showTestDataPanel}
+                                    aria-controls="spec-test-data-panel"
+                                    onClick={() => setShowTestDataPanel(prev => !prev)}
+                                >
+                                    <Database size={14} /> Insert test data
+                                </button>
+                                {!isEditing && mode === 'code' && (
+                                    <button
+                                        className="btn btn-secondary btn-sm"
+                                        onClick={() => setIsEditing(true)}
+                                    >
+                                        <Edit size={14} /> Edit spec
+                                    </button>
+                                )}
+                                {(isEditing || hasChanges) && (
+                                    <button
+                                        type="button"
+                                        className="btn btn-secondary btn-sm"
+                                        onClick={handleCancelSpecEdit}
+                                    >
+                                        <X size={14} /> Cancel
+                                    </button>
+                                )}
+                                {(isEditing || hasChanges) && (
+                                    <button className="btn btn-primary btn-sm" onClick={handleSave} disabled={saving}>
+                                        {saving ? 'Saving...' : <><Save size={14} /> Save</>}
+                                    </button>
+                                )}
+                            </div>}
+                        </div>
+                        {canEdit && showTestDataPanel && (
+                            <div id="spec-test-data-panel" style={testDataPanelStyle}>
+                                <TestDataPicker
+                                    projectId={currentProject?.id}
+                                    mode="directive"
+                                    compact
+                                    insertLabel="Insert"
+                                    editLabel="Edit data"
+                                    onInserted={() => setShowTestDataPanel(false)}
+                                    onInsert={(value) => {
+                                        setContent(prev => `${prev.trimEnd()}\n\n${value}\n`);
+                                        setIsEditing(true);
+                                    }}
+                                />
+                            </div>
+                        )}
+                        <div style={{ flex: 1, overflow: 'hidden', position: 'relative', background: 'var(--code-bg)' }}>
+                            {mode === 'visual' ? (
+                                <div style={{ position: 'absolute', inset: 0, overflow: 'auto' }}>
+                                    <SpecBuilder content={content} onChange={setContent} />
+                                </div>
+                            ) : (
+                                isEditing ? (
+                                    <div style={{ position: 'absolute', inset: 0 }}>
+                                        <CodeEditor
+                                            value={content}
+                                            onChange={setContent}
+                                            language="markdown"
+                                        />
+                                    </div>
+                                ) : (
+                                    <div style={{ position: 'absolute', inset: 0, overflow: 'auto' }}>
+                                        <SyntaxHighlighter
+                                            language="markdown"
+                                            style={vscDarkPlus}
+                                            customStyle={{ margin: 0, padding: '1.5rem', fontSize: '0.9rem', background: 'var(--code-bg)', minHeight: '100%' }}
+                                            showLineNumbers={true}
+                                            wrapLines={true}
+                                        >
+                                            {content || ''}
+                                        </SyntaxHighlighter>
+                                    </div>
+                                )
+                            )}
+                        </div>
+                    </div>
+                ) : (
+                    <div className="card-elevated" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', padding: 0 }}>
+                        {loadingCode ? (
+                            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-secondary)' }}>
+                                <div style={{ textAlign: 'center' }}>
+                                    <div className="loading-spinner" style={{ width: '32px', height: '32px', margin: '0 auto 1rem' }}></div>
+                                    <p>Loading generated test code...</p>
+                                </div>
+                            </div>
+                        ) : generatedCode ? (
+                            <>
+                                <div style={{
+                                    display: 'flex',
+                                    justifyContent: 'space-between',
+                                    alignItems: 'center',
+                                    padding: '0.75rem 1rem',
+                                    borderBottom: '1px solid var(--border)',
+                                    background: 'var(--surface)',
+                                }}>
+                                    <code style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>{codePath}</code>
+                                    <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                        {canEdit && isEditingCode ? (
+                                            <>
+                                                <button
+                                                    className="btn btn-secondary btn-sm"
+                                                    onClick={() => {
+                                                        setGeneratedCode(originalGeneratedCode);
+                                                        setIsEditingCode(false);
+                                                    }}
+                                                >
+                                                    Cancel
+                                                </button>
+                                                <button
+                                                    className="btn btn-primary btn-sm"
+                                                    onClick={handleSaveGeneratedCode}
+                                                    disabled={savingCode}
+                                                >
+                                                    {savingCode ? 'Saving...' : <><Save size={14} /> Save</>}
+                                                </button>
+                                            </>
+                                        ) : canEdit ? (
+                                            <button
+                                                className="btn btn-secondary btn-sm"
+                                                onClick={() => setIsEditingCode(true)}
+                                            >
+                                                <Edit size={14} /> Edit generated test
+                                            </button>
+                                        ) : null}
+                                    </div>
+                                </div>
+                                <div style={{ flex: 1, overflow: 'hidden', position: 'relative', background: 'var(--code-bg)' }}>
+                                    {canEdit && isEditingCode ? (
+                                        <div style={{ position: 'absolute', inset: 0 }}>
+                                            <CodeEditor
+                                                value={generatedCode || ''}
+                                                onChange={(val) => setGeneratedCode(val)}
+                                                language="typescript"
+                                            />
+                                        </div>
+                                    ) : (
+                                        <div style={{ position: 'absolute', inset: 0, overflow: 'auto' }}>
+                                            <SyntaxHighlighter
+                                                language="typescript"
+                                                style={vscDarkPlus}
+                                                customStyle={{ margin: 0, padding: '1.5rem', fontSize: '0.85rem', background: 'var(--code-bg)', minHeight: '100%' }}
+                                                showLineNumbers={true}
+                                                wrapLines={true}
+                                            >
+                                                {generatedCode}
+                                            </SyntaxHighlighter>
+                                        </div>
+                                    )}
+                                </div>
+                            </>
+                        ) : (
+                            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-secondary)' }}>
+                                <div style={{ textAlign: 'center' }}>
+                                    <Code size={48} style={{ marginBottom: '1rem', opacity: 0.5 }} />
+                                    <p>No generated test available</p>
+                                    <p style={{ fontSize: '0.85rem', marginTop: '0.5rem' }}>Run this spec to generate a Playwright test.</p>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        </PageLayout>
+    );
+}

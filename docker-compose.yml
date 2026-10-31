@@ -1,0 +1,466 @@
+# Quorvex AI - Docker Compose Configuration
+#
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose up -d db       # Start database only
+#   docker-compose down           # Stop all services
+#   docker-compose logs -f        # View logs
+
+x-backend-slim: &backend-slim
+  image: quorvex-backend-slim:local
+  build:
+    context: .
+    dockerfile: docker/backend-slim/Dockerfile
+
+x-backend-vnc: &backend-vnc
+  image: quorvex-backend-vnc:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: backend
+
+services:
+  backend:
+    <<: *backend-slim
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '4.0'
+    container_name: quorvex-backend
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./runs:/app/runs
+      - ./specs:/app/specs
+      - ./tests:/app/tests
+      - ./test-results:/app/test-results
+      - ./data:/app/data
+      - ./prds:/app/prds
+      - ./scripts:/app/scripts
+      # Mount code directories for hot-reload during development
+      - ./orchestrator:/app/orchestrator
+      - ./.claude:/app/.claude
+    environment:
+      # AI/LLM Configuration (from .env)
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_AUTH_TOKENS=${ANTHROPIC_AUTH_TOKENS:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-glm-5.1}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5-turbo}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}
+      - ANTHROPIC_CHAT_MODEL=${ANTHROPIC_CHAT_MODEL:-glm-5-turbo}
+      - QUORVEX_LLM_PROVIDER=${QUORVEX_LLM_PROVIDER:-anthropic_compatible}
+      - QUORVEX_LLM_BASE_URL=${QUORVEX_LLM_BASE_URL:-${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}}
+      - QUORVEX_LLM_API_KEY=${QUORVEX_LLM_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}
+      - QUORVEX_LLM_API_KEYS=${QUORVEX_LLM_API_KEYS:-${ANTHROPIC_AUTH_TOKENS:-}}
+      - QUORVEX_LLM_LIGHT_MODEL=${QUORVEX_LLM_LIGHT_MODEL:-${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}}
+      - QUORVEX_LLM_STANDARD_MODEL=${QUORVEX_LLM_STANDARD_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5-turbo}}
+      - QUORVEX_LLM_DEEP_MODEL=${QUORVEX_LLM_DEEP_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}}
+      - QUORVEX_LLM_TOOL_DEEP_MODEL=${QUORVEX_LLM_TOOL_DEEP_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}}
+      - QUORVEX_LLM_CHAT_MODEL=${QUORVEX_LLM_CHAT_MODEL:-${ANTHROPIC_CHAT_MODEL:-glm-5-turbo}}
+      - QUORVEX_EMBEDDING_MODEL=${QUORVEX_EMBEDDING_MODEL:-text-embedding-3-small}
+      - API_TIMEOUT_MS=${API_TIMEOUT_MS:-3000000}
+      - QUORVEX_AGENT_RUNTIME=${QUORVEX_AGENT_RUNTIME:-claude_sdk}
+      # Memory System
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - MEMORY_ENABLED=${MEMORY_ENABLED:-true}
+      - CHROMADB_PERSIST_DIRECTORY=/app/data/chromadb
+      # Database (internal Docker network)
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/playwright_agent
+      # Redis and remote browser workers
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - USE_AGENT_QUEUE=${USE_AGENT_QUEUE:-true}
+      - BROWSER_WORKERS_ENABLED=true
+      - LIVE_BROWSER_WORKER_ENABLED=${LIVE_BROWSER_WORKER_ENABLED:-true}
+      - VNC_PUBLIC_WS_URL=${VNC_PUBLIC_WS_URL:-ws://localhost:6080/websockify}
+      - HEADLESS=true
+      - PLAYWRIGHT_WORKERS=${PLAYWRIGHT_WORKERS:-2}
+      - DEFAULT_PARALLELISM=${DEFAULT_PARALLELISM:-2}
+      # Temporal (for autonomous testing missions)
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+      - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE:-quorvex-autonomous-missions}
+      - TEMPORAL_WORKFLOW_TASK_QUEUE=${TEMPORAL_WORKFLOW_TASK_QUEUE:-quorvex-custom-workflows}
+      - TEMPORAL_BROWSER_WORKFLOW_TASK_QUEUE=${TEMPORAL_BROWSER_WORKFLOW_TASK_QUEUE:-quorvex-browser-workflows}
+      - TEMPORAL_UI_URL=${TEMPORAL_UI_URL:-http://localhost:8233}
+      # Authentication
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      - REQUIRE_AUTH=${REQUIRE_AUTH:-true}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-false}
+      # Test Credentials (pass through from .env)
+      - LOGIN_USERNAME=${LOGIN_USERNAME:-}
+      - LOGIN_PASSWORD=${LOGIN_PASSWORD:-}
+      # Add your test credentials here:
+      # - MY_APP_USERNAME=${MY_APP_USERNAME:-}
+      # - MY_APP_PASSWORD=${MY_APP_PASSWORD:-}
+      - INVENTORY_EMAIL=${INVENTORY_EMAIL:-}
+      - INVENTORY_PASSWORD=${INVENTORY_PASSWORD:-}
+      - RESOURCE_NAME=${RESOURCE_NAME:-}
+      - RESOURCE_QUANTITY=${RESOURCE_QUANTITY:-}
+      - RESOURCE_CAPACITY=${RESOURCE_CAPACITY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      browser-workers:
+        condition: service_healthy
+      browser-runtime:
+        condition: service_started
+      temporal:
+        condition: service_started
+    command: python -m uvicorn orchestrator.api.main:app --host 0.0.0.0 --port 8001 --reload
+    networks:
+      - playwright-network
+    restart: unless-stopped
+
+  autonomous-mission-worker:
+    <<: *backend-slim
+    container_name: quorvex-autonomous-mission-worker
+    command: python -m orchestrator.services.autonomous_mission_worker
+    healthcheck:
+      disable: true
+    volumes:
+      - ./runs:/app/runs
+      - ./specs:/app/specs
+      - ./tests:/app/tests
+      - ./test-results:/app/test-results
+      - ./data:/app/data
+      - ./orchestrator:/app/orchestrator
+      - ./.claude:/app/.claude
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/playwright_agent
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - USE_AGENT_QUEUE=${USE_AGENT_QUEUE:-true}
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+      - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE:-quorvex-autonomous-missions}
+      - BROWSER_WORKERS_ENABLED=true
+      - HEADLESS=true
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      - REQUIRE_AUTH=${REQUIRE_AUTH:-true}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-false}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_AUTH_TOKENS=${ANTHROPIC_AUTH_TOKENS:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-glm-5.1}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5-turbo}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}
+      - ANTHROPIC_CHAT_MODEL=${ANTHROPIC_CHAT_MODEL:-glm-5-turbo}
+      - QUORVEX_LLM_PROVIDER=${QUORVEX_LLM_PROVIDER:-anthropic_compatible}
+      - QUORVEX_LLM_BASE_URL=${QUORVEX_LLM_BASE_URL:-${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}}
+      - QUORVEX_LLM_API_KEY=${QUORVEX_LLM_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}
+      - QUORVEX_LLM_API_KEYS=${QUORVEX_LLM_API_KEYS:-${ANTHROPIC_AUTH_TOKENS:-}}
+      - QUORVEX_LLM_LIGHT_MODEL=${QUORVEX_LLM_LIGHT_MODEL:-${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}}
+      - QUORVEX_LLM_STANDARD_MODEL=${QUORVEX_LLM_STANDARD_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5-turbo}}
+      - QUORVEX_LLM_DEEP_MODEL=${QUORVEX_LLM_DEEP_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}}
+      - QUORVEX_LLM_TOOL_DEEP_MODEL=${QUORVEX_LLM_TOOL_DEEP_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}}
+      - QUORVEX_LLM_CHAT_MODEL=${QUORVEX_LLM_CHAT_MODEL:-${ANTHROPIC_CHAT_MODEL:-glm-5-turbo}}
+      - QUORVEX_EMBEDDING_MODEL=${QUORVEX_EMBEDDING_MODEL:-text-embedding-3-small}
+      - API_TIMEOUT_MS=${API_TIMEOUT_MS:-3000000}
+      - QUORVEX_AGENT_RUNTIME=${QUORVEX_AGENT_RUNTIME:-claude_sdk}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - MEMORY_ENABLED=${MEMORY_ENABLED:-true}
+      - CHROMADB_PERSIST_DIRECTORY=/app/data/chromadb
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    networks:
+      - playwright-network
+    restart: unless-stopped
+
+  custom-workflow-worker:
+    <<: *backend-slim
+    container_name: quorvex-custom-workflow-worker
+    command: python -m orchestrator.services.custom_workflow_worker
+    healthcheck:
+      disable: true
+    volumes:
+      - ./runs:/app/runs
+      - ./specs:/app/specs
+      - ./tests:/app/tests
+      - ./test-results:/app/test-results
+      - ./data:/app/data
+      - ./orchestrator:/app/orchestrator
+      - ./.claude:/app/.claude
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/playwright_agent
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - USE_AGENT_QUEUE=${USE_AGENT_QUEUE:-true}
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+      - TEMPORAL_WORKFLOW_TASK_QUEUE=${TEMPORAL_WORKFLOW_TASK_QUEUE:-quorvex-custom-workflows}
+      - TEMPORAL_BROWSER_WORKFLOW_TASK_QUEUE=${TEMPORAL_BROWSER_WORKFLOW_TASK_QUEUE:-quorvex-browser-workflows}
+      - TEMPORAL_UI_URL=${TEMPORAL_UI_URL:-http://localhost:8233}
+      - BROWSER_WORKERS_ENABLED=true
+      - HEADLESS=true
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      - REQUIRE_AUTH=${REQUIRE_AUTH:-true}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-false}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_AUTH_TOKENS=${ANTHROPIC_AUTH_TOKENS:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-glm-5.1}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5-turbo}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}
+      - ANTHROPIC_CHAT_MODEL=${ANTHROPIC_CHAT_MODEL:-glm-5-turbo}
+      - QUORVEX_LLM_PROVIDER=${QUORVEX_LLM_PROVIDER:-anthropic_compatible}
+      - QUORVEX_LLM_BASE_URL=${QUORVEX_LLM_BASE_URL:-${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}}
+      - QUORVEX_LLM_API_KEY=${QUORVEX_LLM_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}
+      - QUORVEX_LLM_API_KEYS=${QUORVEX_LLM_API_KEYS:-${ANTHROPIC_AUTH_TOKENS:-}}
+      - QUORVEX_LLM_LIGHT_MODEL=${QUORVEX_LLM_LIGHT_MODEL:-${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}}
+      - QUORVEX_LLM_STANDARD_MODEL=${QUORVEX_LLM_STANDARD_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5-turbo}}
+      - QUORVEX_LLM_DEEP_MODEL=${QUORVEX_LLM_DEEP_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}}
+      - QUORVEX_LLM_TOOL_DEEP_MODEL=${QUORVEX_LLM_TOOL_DEEP_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}}
+      - QUORVEX_LLM_CHAT_MODEL=${QUORVEX_LLM_CHAT_MODEL:-${ANTHROPIC_CHAT_MODEL:-glm-5-turbo}}
+      - QUORVEX_EMBEDDING_MODEL=${QUORVEX_EMBEDDING_MODEL:-text-embedding-3-small}
+      - API_TIMEOUT_MS=${API_TIMEOUT_MS:-3000000}
+      - QUORVEX_AGENT_RUNTIME=${QUORVEX_AGENT_RUNTIME:-claude_sdk}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - MEMORY_ENABLED=${MEMORY_ENABLED:-true}
+      - CHROMADB_PERSIST_DIRECTORY=/app/data/chromadb
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    networks:
+      - playwright-network
+    restart: unless-stopped
+
+  browser-workers:
+    image: quorvex-browser-worker:local
+    build:
+      context: .
+      dockerfile: docker/browser-worker/Dockerfile
+    container_name: quorvex-browser-worker
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - HEADLESS=true
+      - PLAYWRIGHT_WORKERS=1
+      - WORKER_ID=browser-worker-local
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./specs:/app/specs:ro
+      - ./test-results:/app/test-results
+    depends_on:
+      redis:
+        condition: service_healthy
+    shm_size: '1gb'
+    networks:
+      - playwright-network
+    healthcheck:
+      test: [ "CMD", "node", "-e", "console.log('ok')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  browser-runtime:
+    <<: *backend-vnc
+    container_name: quorvex-browser-runtime
+    command: /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
+    ports:
+      - "6080:6080"
+    volumes:
+      - ./runs:/app/runs
+      - ./specs:/app/specs
+      - ./tests:/app/tests
+      - ./test-results:/app/test-results
+      - ./data:/app/data
+      - ./prds:/app/prds
+      - ./scripts:/app/scripts
+      - ./orchestrator:/app/orchestrator
+      - ./.claude:/app/.claude
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/playwright_agent
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - USE_AGENT_QUEUE=${USE_AGENT_QUEUE:-true}
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+      - TEMPORAL_TASK_QUEUE=${TEMPORAL_TASK_QUEUE:-quorvex-autonomous-missions}
+      - TEMPORAL_WORKFLOW_TASK_QUEUE=${TEMPORAL_WORKFLOW_TASK_QUEUE:-quorvex-custom-workflows}
+      - TEMPORAL_BROWSER_WORKFLOW_TASK_QUEUE=${TEMPORAL_BROWSER_WORKFLOW_TASK_QUEUE:-quorvex-browser-workflows}
+      - CUSTOM_WORKFLOW_WORKER_ENABLED=true
+      - AUTONOMOUS_MISSION_WORKER_ENABLED=false
+      - VNC_ENABLED=true
+      - DISPLAY=:99
+      - HEADLESS=false
+      - PLAYWRIGHT_HEADLESS=false
+      - TEST_RUN_PLAYWRIGHT_WORKERS=${TEST_RUN_PLAYWRIGHT_WORKERS:-1}
+      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      - REQUIRE_AUTH=${REQUIRE_AUTH:-true}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-false}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_AUTH_TOKENS=${ANTHROPIC_AUTH_TOKENS:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-glm-5.1}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5-turbo}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}
+      - ANTHROPIC_CHAT_MODEL=${ANTHROPIC_CHAT_MODEL:-glm-5-turbo}
+      - QUORVEX_LLM_PROVIDER=${QUORVEX_LLM_PROVIDER:-anthropic_compatible}
+      - QUORVEX_LLM_BASE_URL=${QUORVEX_LLM_BASE_URL:-${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}}
+      - QUORVEX_LLM_API_KEY=${QUORVEX_LLM_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}
+      - QUORVEX_LLM_API_KEYS=${QUORVEX_LLM_API_KEYS:-${ANTHROPIC_AUTH_TOKENS:-}}
+      - QUORVEX_LLM_LIGHT_MODEL=${QUORVEX_LLM_LIGHT_MODEL:-${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}}
+      - QUORVEX_LLM_STANDARD_MODEL=${QUORVEX_LLM_STANDARD_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5-turbo}}
+      - QUORVEX_LLM_DEEP_MODEL=${QUORVEX_LLM_DEEP_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}}
+      - QUORVEX_LLM_TOOL_DEEP_MODEL=${QUORVEX_LLM_TOOL_DEEP_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.1}}
+      - QUORVEX_LLM_CHAT_MODEL=${QUORVEX_LLM_CHAT_MODEL:-${ANTHROPIC_CHAT_MODEL:-glm-5-turbo}}
+      - QUORVEX_EMBEDDING_MODEL=${QUORVEX_EMBEDDING_MODEL:-text-embedding-3-small}
+      - API_TIMEOUT_MS=${API_TIMEOUT_MS:-3000000}
+      - QUORVEX_AGENT_RUNTIME=${QUORVEX_AGENT_RUNTIME:-claude_sdk}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    shm_size: '1gb'
+    networks:
+      - playwright-network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+    container_name: quorvex-frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount source code for hot-reload during development
+      - ./web/src:/app/src
+      - ./web/public:/app/public
+    environment:
+      # Note: For browser access, this still uses localhost since the browser
+      # runs on the host machine, not inside Docker
+      - NEXT_PUBLIC_API_URL=http://localhost:8001
+      - QUORVEX_AGENT_RUNTIME=${QUORVEX_AGENT_RUNTIME:-claude_sdk}
+      - QUORVEX_ASSISTANT_RUNTIME=${QUORVEX_ASSISTANT_RUNTIME:-claude_sdk}
+      - WATCHPACK_POLLING=true
+      - NODE_OPTIONS=--max-old-space-size=2048
+    depends_on:
+      - backend
+    networks:
+      - playwright-network
+    restart: unless-stopped
+
+  db:
+    image: postgres:15-alpine
+    container_name: quorvex-db-dev
+    ports:
+      - "5434:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=playwright_agent
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    networks:
+      - playwright-network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d playwright_agent" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Optional Redis for K6 distributed mode in development
+  redis:
+    image: redis:7-alpine
+    container_name: quorvex-redis-dev
+    ports:
+      - "6379:6379"
+    networks:
+      - playwright-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  temporal:
+    image: temporalio/auto-setup:1.24
+    container_name: quorvex-temporal-dev
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PWD=postgres
+      - POSTGRES_SEEDS=db
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - playwright-network
+    restart: unless-stopped
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    container_name: quorvex-temporal-ui-dev
+    ports:
+      - "8233:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+    networks:
+      - playwright-network
+    restart: unless-stopped
+
+  # K6 Load Test Worker (dev mode with auto-mounted code)
+  k6-workers:
+    build:
+      context: .
+      dockerfile: docker/k6-worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/playwright_agent
+      K6_TIMEOUT_SECONDS: ${K6_TIMEOUT_SECONDS:-3600}
+      K6_MAX_VUS: ${K6_MAX_VUS:-100}
+      # K6_WORKER_ID is auto-generated from container hostname
+    volumes:
+      # Mount code for hot-reload during development
+      - ./orchestrator:/app/orchestrator
+      - ./scripts:/app/scripts:ro
+      - ./runs:/app/runs
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    profiles:
+      - k6-workers
+    networks:
+      - playwright-network
+
+networks:
+  playwright-network:
+    driver: bridge
+
+volumes:
+  postgres_data_dev:

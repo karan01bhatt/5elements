@@ -1,0 +1,1613 @@
+'use client';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import {
+    ArrowLeft, CheckCircle, Copy, Check, Image as ImageIcon, Video as VideoIcon,
+    ExternalLink, Code, Layout, FileText, Eye, Globe, Chrome, Compass, Clock, XCircle, Square, Monitor,
+    Bug, Loader2, X, Edit3, AlertTriangle, Wrench
+} from 'lucide-react';
+import Link from 'next/link';
+import { useParams } from 'next/navigation';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { useRequiredProject } from '@/contexts/ProjectContext';
+import { useProjectRole } from '@/hooks/useProjectRole';
+import { LiveBrowserView } from '@/components/LiveBrowserView';
+import { API_BASE, withProjectQuery } from '@/lib/api';
+import { PageLayout } from '@/components/ui/page-layout';
+import { PageHeader } from '@/components/ui/page-header';
+import { formatAge, resolveLinkedAgentRunId, resolveRunHealth } from '@/lib/run-observability';
+import { AgentRunObservabilityPanel } from '../../agents/agents-panels';
+import { agentRunEventsStreamUrl, agentRunTraceExportUrl, fetchAgentRun, fetchAgentRunEvents, fetchAgentRunTrace } from '../../agents/agents-api';
+import { agentRunNoteFromEvent, isAgentRunTerminal, LIVE_AGENT_STATUSES, mergeAgentRunNotes } from '../../agents/agents-model';
+import type { AgentRun, AgentRunEvent, AgentRunNote, AgentTraceBundle } from '../../agents/agents-model';
+
+interface Artifact {
+    name: string;
+    path: string;
+    type: 'image' | 'video';
+    modified_at?: string | null;
+}
+
+interface VisualDiff {
+    name: string;
+    diff?: Artifact;
+    expected?: Artifact;
+    actual?: Artifact;
+}
+
+const ACTIVE_RUN_STATUSES = new Set(['queued', 'pending', 'running', 'in_progress']);
+const STREAMING_RUN_STATUSES = new Set(['running', 'in_progress']);
+const AGENT_NOTE_LOG_SECTION_TITLES = new Set(['Agent Notes', 'Raw Agent Notes']);
+
+function getRunStatus(runData: any): string {
+    const persistedStatus = runData?.status;
+    if (ACTIVE_RUN_STATUSES.has(persistedStatus)) return persistedStatus;
+    return runData?.effective_status || persistedStatus || runData?.run?.status || 'unknown';
+}
+
+function isActiveRunData(runData: any): boolean {
+    return ACTIVE_RUN_STATUSES.has(getRunStatus(runData));
+}
+
+function isStreamingRunData(runData: any): boolean {
+    return STREAMING_RUN_STATUSES.has(getRunStatus(runData));
+}
+
+function agentLogSectionsToNotes(sections: any[], runId: string, createdAt?: string | null): AgentRunNote[] {
+    const timestamp = createdAt || new Date(0).toISOString();
+    const notes: AgentRunNote[] = [];
+    sections.forEach((section, sectionIndex) => {
+        const title = String(section?.title || '').trim();
+        if (!AGENT_NOTE_LOG_SECTION_TITLES.has(title)) return;
+        const content = String(section?.content || '').trim();
+        if (!content) return;
+        const chunks = content.split(/\n{2,}/).map(chunk => chunk.trim()).filter(Boolean);
+        (chunks.length ? chunks : [content]).forEach((chunk, chunkIndex) => {
+            notes.push({
+                id: `recovered-${runId}-${sectionIndex}-${chunkIndex}`,
+                run_id: runId,
+                sequence: -1_000_000 + (sectionIndex * 1000) + chunkIndex,
+                note_type: 'observation',
+                level: 'info',
+                title: chunks.length > 1 ? `${title} ${chunkIndex + 1}` : title,
+                body: chunk,
+                source: typeof section?.source === 'string' && section.source ? section.source : 'test_run_log',
+                tags: ['recovered', 'test-run-log'],
+                actionable: false,
+                created_at: timestamp,
+            });
+        });
+    });
+    return notes;
+}
+
+function mergeAgentEventLists(existing: AgentRunEvent[], incoming: AgentRunEvent[]) {
+    const bySequence = new Map<number, AgentRunEvent>();
+    [...existing, ...incoming].forEach(item => {
+        if (Number.isFinite(item.sequence)) bySequence.set(item.sequence, item);
+    });
+    return [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
+}
+
+export default function RunDetailPage() {
+    const params = useParams();
+    const id = params?.id as string;
+    const { currentProject, projectId, isLoading: projectLoading } = useRequiredProject();
+    const { canEdit } = useProjectRole(projectId);
+    const [data, setData] = useState<any>(null);
+    const [loading, setLoading] = useState(true);
+    const [copied, setCopied] = useState(false);
+    const [streamingLog, setStreamingLog] = useState<string>('');
+    const [isStreaming, setIsStreaming] = useState(false);
+    const [viewMode, setViewMode] = useState<'browser' | 'log'>('log'); // Default to log (VNC may not be available)
+    const [autoSelectedBrowser, setAutoSelectedBrowser] = useState(false);
+    const [linkedAgentRun, setLinkedAgentRun] = useState<AgentRun | null>(null);
+    const [linkedAgentEvents, setLinkedAgentEvents] = useState<AgentRunEvent[]>([]);
+    const [linkedAgentTrace, setLinkedAgentTrace] = useState<AgentTraceBundle | null>(null);
+    const [linkedAgentTraceLoading, setLinkedAgentTraceLoading] = useState(false);
+    const linkedAgentEventsRef = useRef<AgentRunEvent[]>([]);
+    const linkedAgentCompletionTraceFetchedRef = useRef<string | null>(null);
+    const logPanelRef = useRef<HTMLDivElement | null>(null);
+    const [isLogPinnedToBottom, setIsLogPinnedToBottom] = useState(true);
+
+    // Jira bug report state
+    const [jiraIssue, setJiraIssue] = useState<{ exists: boolean; jira_issue_key?: string; jira_url?: string; summary?: string } | null>(null);
+    const [bugReportLoading, setBugReportLoading] = useState(false);
+    const [bugReportModal, setBugReportModal] = useState(false);
+    const [bugReport, setBugReport] = useState<any>(null);
+    const [bugReportTitle, setBugReportTitle] = useState('');
+    const [bugReportDescription, setBugReportDescription] = useState('');
+    const [bugReportPriority, setBugReportPriority] = useState('P3');
+    const [bugReportLabels, setBugReportLabels] = useState<string[]>([]);
+    const [creatingIssue, setCreatingIssue] = useState(false);
+    const [jiraConfig, setJiraConfig] = useState<{ configured: boolean; project_key?: string; issue_type_id?: string } | null>(null);
+
+    const currentRunStatus = getRunStatus(data);
+    const currentRunIsActive = isActiveRunData(data);
+    const currentRunIsStreaming = isStreamingRunData(data);
+    const resolvedLinkedAgentRunId = useMemo(() => resolveLinkedAgentRunId(data), [data]);
+
+    useEffect(() => {
+        linkedAgentEventsRef.current = linkedAgentEvents;
+    }, [linkedAgentEvents]);
+
+    const mergeLinkedAgentEvents = useCallback((incoming: AgentRunEvent[]) => {
+        setLinkedAgentEvents(prev => mergeAgentEventLists(prev, incoming));
+    }, []);
+
+    const fetchRunData = useCallback(() => {
+        if (!projectId) return Promise.resolve(null);
+        return fetch(`${API_BASE}${withProjectQuery(`/runs/${id}`, projectId)}`)
+            .then(res => res.json())
+            .then(d => {
+                setData(d);
+                setLoading(false);
+                return d;
+            })
+            .catch(err => {
+                console.error(err);
+                setLoading(false);
+                return null;
+            });
+    }, [id, projectId]);
+
+    useEffect(() => {
+        if (!id || projectLoading || !projectId) return;
+        setViewMode('log');
+        setAutoSelectedBrowser(false);
+        fetchRunData();
+    }, [id, projectId, projectLoading, fetchRunData]);
+
+    useEffect(() => {
+        if (!data || autoSelectedBrowser) return;
+        if (currentRunIsActive && data.live_view_available) {
+            setViewMode('browser');
+            setAutoSelectedBrowser(true);
+        }
+    }, [data, currentRunIsActive, autoSelectedBrowser]);
+
+    useEffect(() => {
+        if (!id || !projectId || !currentRunIsActive) return;
+
+        const interval = window.setInterval(async () => {
+            const latest = await fetchRunData();
+            if (!latest || !isActiveRunData(latest)) {
+                window.clearInterval(interval);
+            }
+        }, 3000);
+
+        return () => window.clearInterval(interval);
+    }, [id, projectId, currentRunIsActive, fetchRunData]);
+
+    useEffect(() => {
+        if (!id || !projectId || !currentRunIsActive) return;
+
+        const eventSource = new EventSource(`${API_BASE}${withProjectQuery(`/runs/${id}/events/stream`, projectId)}`);
+
+        eventSource.addEventListener('status', (event) => {
+            try {
+                const eventData = JSON.parse(event.data);
+                setData((prev: any) => prev ? { ...prev, ...eventData } : prev);
+            } catch (e) {
+                console.error('Error parsing run status SSE data:', e);
+            }
+        });
+
+        eventSource.addEventListener('diagnostic', (event) => {
+            try {
+                const eventData = JSON.parse(event.data);
+                setData((prev: any) => prev ? {
+                    ...prev,
+                    health: eventData.health || prev.health,
+                    diagnostics: { ...(prev.diagnostics || {}), ...(eventData.diagnostics || {}) },
+                    blocker_message: eventData.blocker_message ?? prev.blocker_message,
+                } : prev);
+            } catch (e) {
+                console.error('Error parsing run diagnostic SSE data:', e);
+            }
+        });
+
+        eventSource.addEventListener('complete', () => {
+            eventSource.close();
+            fetchRunData();
+        });
+
+        eventSource.addEventListener('error', () => {
+            eventSource.close();
+        });
+
+        return () => eventSource.close();
+    }, [currentRunIsActive, fetchRunData, id, projectId]);
+
+    // Check if Jira issue exists for this run + load Jira config
+    useEffect(() => {
+        if (!id || !currentProject?.id) return;
+        const pid = encodeURIComponent(currentProject.id);
+
+        fetch(`${API_BASE}/jira/${pid}/issues/${id}`)
+            .then(res => res.json())
+            .then(d => setJiraIssue(d))
+            .catch(() => {});
+
+        fetch(`${API_BASE}/jira/${pid}/config`)
+            .then(res => res.json())
+            .then(d => setJiraConfig(d))
+            .catch(() => {});
+    }, [id, currentProject?.id]);
+
+    // Set up live log streaming for running tests
+    useEffect(() => {
+        if (!id) return;
+
+        if (!currentRunIsStreaming) {
+            setIsStreaming(false);
+            return;
+        }
+
+        setIsStreaming(true);
+        setStreamingLog(''); // Reset streaming log
+
+        const eventSource = new EventSource(`${API_BASE}${withProjectQuery(`/runs/${id}/log/stream`, projectId)}`);
+
+        eventSource.onmessage = (event) => {
+            try {
+                const eventData = JSON.parse(event.data);
+
+                if (eventData.log) {
+                    setStreamingLog(prev => prev + eventData.log);
+                }
+
+                if (eventData.status === 'complete') {
+                    setIsStreaming(false);
+                    eventSource.close();
+                    // Refresh data to get final state
+                    fetchRunData();
+                }
+
+                if (eventData.status === 'error' || eventData.status === 'timeout') {
+                    setIsStreaming(false);
+                    eventSource.close();
+                }
+            } catch (e) {
+                console.error('Error parsing SSE data:', e);
+            }
+        };
+
+        eventSource.onerror = (err) => {
+            console.error('EventSource error:', err);
+            setIsStreaming(false);
+            eventSource.close();
+        };
+
+        return () => {
+            eventSource.close();
+        };
+    }, [currentRunIsStreaming, id, projectId, fetchRunData]);
+
+    useEffect(() => {
+        const linkedAgentRunId = resolvedLinkedAgentRunId;
+        if (!linkedAgentRunId) {
+            setLinkedAgentRun(null);
+            setLinkedAgentEvents([]);
+            setLinkedAgentTrace(null);
+            linkedAgentEventsRef.current = [];
+            linkedAgentCompletionTraceFetchedRef.current = null;
+            return;
+        }
+
+        const controller = new AbortController();
+        setLinkedAgentTraceLoading(true);
+        setLinkedAgentEvents([]);
+        linkedAgentEventsRef.current = [];
+        linkedAgentCompletionTraceFetchedRef.current = null;
+        Promise.allSettled([
+            fetchAgentRun(linkedAgentRunId, { projectId, signal: controller.signal }),
+            fetchAgentRunEvents(linkedAgentRunId, { limit: 150, projectId, signal: controller.signal }),
+            fetchAgentRunTrace(linkedAgentRunId, projectId),
+        ]).then(results => {
+            if (controller.signal.aborted) return;
+            const [runResult, eventsResult, traceResult] = results;
+            setLinkedAgentRun(runResult.status === 'fulfilled' ? runResult.value : null);
+            if (eventsResult.status === 'fulfilled') mergeLinkedAgentEvents(eventsResult.value);
+            setLinkedAgentTrace(traceResult.status === 'fulfilled' ? traceResult.value : null);
+        }).finally(() => {
+            if (!controller.signal.aborted) setLinkedAgentTraceLoading(false);
+        });
+
+        return () => controller.abort();
+    }, [resolvedLinkedAgentRunId, mergeLinkedAgentEvents, projectId]);
+
+    useEffect(() => {
+        const linkedAgentRunId = resolvedLinkedAgentRunId;
+        if (!linkedAgentRunId || !linkedAgentRun || !LIVE_AGENT_STATUSES.has(linkedAgentRun.status)) return;
+        const activeLinkedAgentRunId: string = linkedAgentRunId;
+
+        let cancelled = false;
+        let attempts = 0;
+        let source: EventSource | null = null;
+        let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const lastSequence = () => linkedAgentEventsRef.current.reduce((max, item) => Math.max(max, item.sequence), 0);
+
+        const backfillEvents = async () => {
+            const events = await fetchAgentRunEvents(activeLinkedAgentRunId, {
+                limit: 200,
+                afterSequence: lastSequence(),
+                projectId,
+            });
+            if (!cancelled) mergeLinkedAgentEvents(events);
+        };
+
+        const closeSource = () => {
+            source?.close();
+            source = null;
+        };
+
+        function scheduleReconnect() {
+            if (cancelled) return;
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            attempts += 1;
+            const delay = Math.min(15000, 750 * Math.pow(2, Math.min(attempts, 5)));
+            reconnectTimer = setTimeout(async () => {
+                reconnectTimer = null;
+                try {
+                    await backfillEvents();
+                    if (!cancelled) {
+                        const latest = await fetchAgentRun(activeLinkedAgentRunId, { projectId });
+                        if (!cancelled) setLinkedAgentRun(latest);
+                    }
+                } catch {
+                    // The EventSource retry loop will try again.
+                }
+                connect();
+            }, delay);
+        }
+
+        function connect() {
+            if (cancelled || source) return;
+            source = new EventSource(agentRunEventsStreamUrl(activeLinkedAgentRunId, {
+                afterSequence: lastSequence(),
+                projectId,
+            }));
+
+            source.onmessage = (event) => {
+                try {
+                    attempts = 0;
+                    mergeLinkedAgentEvents([JSON.parse(event.data)]);
+                } catch {
+                    closeSource();
+                    scheduleReconnect();
+                }
+            };
+
+            source.addEventListener('complete', () => {
+                closeSource();
+                void fetchAgentRun(activeLinkedAgentRunId, { projectId })
+                    .then(setLinkedAgentRun)
+                    .catch(() => {});
+                void backfillEvents();
+                if (linkedAgentCompletionTraceFetchedRef.current !== activeLinkedAgentRunId) {
+                    linkedAgentCompletionTraceFetchedRef.current = activeLinkedAgentRunId;
+                    setLinkedAgentTraceLoading(true);
+                    void fetchAgentRunTrace(activeLinkedAgentRunId, projectId)
+                        .then(setLinkedAgentTrace)
+                        .catch(() => {})
+                        .finally(() => setLinkedAgentTraceLoading(false));
+                }
+            });
+
+            source.onerror = () => {
+                closeSource();
+                scheduleReconnect();
+            };
+        }
+
+        void backfillEvents().finally(connect);
+
+        return () => {
+            cancelled = true;
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            closeSource();
+        };
+    }, [resolvedLinkedAgentRunId, linkedAgentRun?.id, linkedAgentRun?.status, mergeLinkedAgentEvents, projectId]);
+
+    useEffect(() => {
+        const linkedAgentRunId = resolvedLinkedAgentRunId;
+        if (!linkedAgentRunId || !linkedAgentRun || !LIVE_AGENT_STATUSES.has(linkedAgentRun.status)) return;
+        let cancelled = false;
+        let inFlight = false;
+
+        const refreshLinkedRun = async () => {
+            if (inFlight) return;
+            inFlight = true;
+            try {
+                const latest = await fetchAgentRun(linkedAgentRunId, { projectId });
+                if (cancelled) return;
+                setLinkedAgentRun(latest);
+                const events = await fetchAgentRunEvents(linkedAgentRunId, {
+                    limit: 200,
+                    afterSequence: linkedAgentEventsRef.current.reduce((max, item) => Math.max(max, item.sequence), 0),
+                    projectId,
+                });
+                if (!cancelled) mergeLinkedAgentEvents(events);
+                if (isAgentRunTerminal(latest.status) && linkedAgentCompletionTraceFetchedRef.current !== linkedAgentRunId) {
+                    linkedAgentCompletionTraceFetchedRef.current = linkedAgentRunId;
+                    setLinkedAgentTraceLoading(true);
+                    fetchAgentRunTrace(linkedAgentRunId, projectId)
+                        .then(trace => {
+                            if (!cancelled) setLinkedAgentTrace(trace);
+                        })
+                        .catch(() => {})
+                        .finally(() => {
+                            if (!cancelled) setLinkedAgentTraceLoading(false);
+                        });
+                }
+            } catch {
+                // Keep the last linked-agent snapshot; SSE/backfill may still recover.
+            } finally {
+                inFlight = false;
+            }
+        };
+
+        const interval = window.setInterval(() => {
+            void refreshLinkedRun();
+        }, 3000);
+        return () => {
+            cancelled = true;
+            window.clearInterval(interval);
+        };
+    }, [resolvedLinkedAgentRunId, linkedAgentRun?.id, linkedAgentRun?.status, mergeLinkedAgentEvents, projectId]);
+
+    const logContentSignature = useMemo(() => {
+        const sections = Array.isArray(data?.log_sections) ? data.log_sections : [];
+        if (sections.length > 0) {
+            return sections
+                .map((section: any) => `${section.source || ''}:${section.title || ''}:${String(section.content || '').length}`)
+                .join('|');
+        }
+        const text = isStreaming ? (streamingLog || data?.log || '') : (data?.log || '');
+        return `${isStreaming ? 'streaming' : 'static'}:${String(text).length}`;
+    }, [data?.log, data?.log_sections, isStreaming, streamingLog]);
+
+    useEffect(() => {
+        if (viewMode !== 'log' || !isLogPinnedToBottom) return;
+        const el = logPanelRef.current;
+        if (!el) return;
+        window.requestAnimationFrame(() => {
+            el.scrollTop = el.scrollHeight;
+        });
+    }, [isLogPinnedToBottom, logContentSignature, viewMode]);
+
+    const updateLogPinnedState = useCallback(() => {
+        const el = logPanelRef.current;
+        if (!el) return;
+        const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+        setIsLogPinnedToBottom(distanceFromBottom <= 32);
+    }, []);
+
+    const jumpToLatestLog = useCallback(() => {
+        const el = logPanelRef.current;
+        if (!el) return;
+        el.scrollTop = el.scrollHeight;
+        setIsLogPinnedToBottom(true);
+    }, []);
+
+    const supplementalLinkedAgentNotes = useMemo(() => {
+        const sections = Array.isArray(data?.log_sections) ? data.log_sections : [];
+        return agentLogSectionsToNotes(
+            sections,
+            resolvedLinkedAgentRunId || linkedAgentRun?.id || id,
+            data?.completed_at || data?.started_at || data?.created_at || data?.run?.completed_at || data?.run?.started_at || data?.run?.created_at,
+        );
+    }, [data?.completed_at, data?.created_at, data?.log_sections, data?.run?.completed_at, data?.run?.created_at, data?.run?.started_at, data?.started_at, id, linkedAgentRun?.id, resolvedLinkedAgentRunId]);
+
+    const linkedNotesSummary = useMemo(() => {
+        if (!linkedAgentRun) return { count: 0, latest: null as AgentRunNote | null };
+        const liveTail = Array.isArray(linkedAgentRun.progress?.live_notes_tail)
+            ? linkedAgentRun.progress.live_notes_tail as AgentRunNote[]
+            : [];
+        const eventNotes = linkedAgentEvents.map(agentRunNoteFromEvent).filter(Boolean) as AgentRunNote[];
+        const notes = mergeAgentRunNotes(mergeAgentRunNotes(liveTail, eventNotes), supplementalLinkedAgentNotes);
+        return {
+            count: notes.length,
+            latest: notes[notes.length - 1] || null,
+        };
+    }, [linkedAgentEvents, linkedAgentRun, supplementalLinkedAgentNotes]);
+
+    if (loading) return (
+        <PageLayout tier="standard">
+            <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '60vh' }}>
+                <div className="loading-spinner"></div>
+            </div>
+        </PageLayout>
+    );
+    if (!data) return <PageLayout tier="standard"><div style={{ paddingTop: '2rem' }}>Run not found.</div></PageLayout>;
+
+    // Process Artifacts for Visual Regression
+    const artifacts: Artifact[] = data.artifacts || [];
+    const visualDiffs: VisualDiff[] = [];
+    const standardArtifacts: Artifact[] = [];
+
+    // Group related screenshots
+    const processedIndices = new Set<number>();
+
+    artifacts.forEach((art, index) => {
+        if (processedIndices.has(index)) return;
+
+        if (art.name.endsWith('-diff.png')) {
+            const baseName = art.name.replace('-diff.png', '');
+            const expected = artifacts.find(a => a.name === `${baseName}-expected.png`);
+            const actual = artifacts.find(a => a.name === `${baseName}-actual.png`);
+
+            visualDiffs.push({
+                name: baseName,
+                diff: art,
+                expected,
+                actual
+            });
+
+            processedIndices.add(index);
+            if (expected) processedIndices.add(artifacts.indexOf(expected));
+            if (actual) processedIndices.add(artifacts.indexOf(actual));
+        } else if (!art.name.match(/-(expected|actual)\.png$/)) {
+            // Only add if not part of a diff set (handled above)
+            standardArtifacts.push(art);
+        }
+    });
+
+    // Add orphan actual/expected if diff is missing (edge case)
+    artifacts.forEach((art, index) => {
+        if (!processedIndices.has(index) && !standardArtifacts.includes(art)) {
+            standardArtifacts.push(art);
+        }
+    });
+
+    const videoArtifacts = standardArtifacts.filter(art => art.type === 'video');
+    const imageArtifacts = standardArtifacts.filter(art => art.type === 'image');
+    const latestImageArtifact = imageArtifacts.some(art => art.modified_at)
+        ? [...imageArtifacts].sort((a, b) => {
+            const bTime = b.modified_at ? new Date(b.modified_at).getTime() : 0;
+            const aTime = a.modified_at ? new Date(a.modified_at).getTime() : 0;
+            return bTime - aTime;
+        })[0] || null
+        : imageArtifacts[imageArtifacts.length - 1] || null;
+
+    const formatRunId = (id: string) => {
+        try {
+            // Extract time portion from format 2026-01-07_22-12-37
+            const timePart = id.split('_')[1];
+            if (timePart) {
+                // Remove dashes and create a compact ID like #221237
+                return `#${timePart.replace(/-/g, '')}`;
+            }
+            // Fallback to last 6 characters
+            return `#${id.slice(-6)}`;
+        } catch (e) {
+            return `#${id.substring(0, 6)}`;
+        }
+    };
+
+    const formatTimestamp = (value?: string | null) => {
+        if (!value) return null;
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return null;
+        return date.toLocaleString();
+    };
+
+    const runStatus = currentRunStatus;
+    const isRunActive = currentRunIsActive;
+    const isRunFinished = !isRunActive && ['passed', 'failed', 'success', 'error', 'stopped', 'completed'].includes(runStatus);
+    const statusDetails = [
+        data.current_stage ? ['Stage', data.current_stage] : null,
+        data.stage_message ? ['Message', data.stage_message] : null,
+        data.blocker_message ? ['Blocker', data.blocker_message] : null,
+        data.healing_attempt ? ['Healing attempt', String(data.healing_attempt)] : null,
+        data.queue_position ? ['Queue', `#${data.queue_position}`] : null,
+        data.temporal_workflow_id ? ['Temporal', data.temporal_workflow_id] : null,
+        formatTimestamp(data.started_at || data.run?.started_at) ? ['Started', formatTimestamp(data.started_at || data.run?.started_at)] : null,
+        formatTimestamp(data.completed_at || data.run?.completed_at) ? ['Completed', formatTimestamp(data.completed_at || data.run?.completed_at)] : null,
+    ].filter(Boolean) as [string, string][];
+    const logSections = Array.isArray(data.log_sections) ? data.log_sections : [];
+    const shouldShowStructuredLogs = logSections.length > 0;
+    const runHealth = resolveRunHealth(data);
+    const temporalDiagnostics = data.diagnostics?.temporal || {};
+    const browserPoolDiagnostics = data.diagnostics?.browser_pool || {};
+    const agentProgress = runHealth.agent_progress || data.diagnostics?.agent_progress || {};
+    const activeTemporalActivities = runHealth.temporal_started_activities || (temporalDiagnostics.activities || []).filter((activity: any) => activity?.status === 'started');
+    const temporalPollers = temporalDiagnostics.task_queue_status;
+    const browserSlotOwner = runHealth.browser_slot_owner || (browserPoolDiagnostics.running_requests || []).find((requestId: string) => requestId === id);
+    const linkedAgentRunId = resolvedLinkedAgentRunId;
+    const exportLinkedAgentTrace = () => {
+        if (!linkedAgentRunId || typeof window === 'undefined') return;
+        window.open(agentRunTraceExportUrl(linkedAgentRunId, projectId), '_blank', 'noopener,noreferrer');
+    };
+
+    const handleStop = async () => {
+        if (!canEdit) return;
+        if (!confirm('Are you sure you want to stop this run?')) return;
+
+        try {
+            const res = await fetch(`${API_BASE}${withProjectQuery(`/runs/${id}/stop`, projectId)}`, { method: 'POST' });
+            const json = await res.json();
+            if (json.status === 'stopped') {
+                // Refresh data
+                const res2 = await fetch(`${API_BASE}${withProjectQuery(`/runs/${id}`, projectId)}`);
+                const d = await res2.json();
+                setData(d);
+            } else {
+                alert('Failed to stop run: ' + (json.message || 'Unknown error'));
+            }
+        } catch (e) {
+            console.error(e);
+            alert('Error stopping run');
+        }
+    };
+
+    const handleGenerateBugReport = async () => {
+        if (!canEdit) return;
+        if (!currentProject?.id) return;
+        setBugReportLoading(true);
+
+        try {
+            const pid = encodeURIComponent(currentProject.id);
+            const res = await fetch(`${API_BASE}/jira/${pid}/generate-bug-report/${id}`, { method: 'POST' });
+            const { job_id } = await res.json();
+
+            // Poll for completion
+            const poll = async () => {
+                const pollRes = await fetch(`${API_BASE}/jira/${pid}/bug-report-jobs/${job_id}`);
+                const pollData = await pollRes.json();
+
+                if (pollData.status === 'completed') {
+                    const report = pollData.result;
+                    setBugReport(report);
+                    setBugReportTitle(report.title || '');
+
+                    // Build description from structured data
+                    const descParts = [];
+                    if (report.description) descParts.push(report.description);
+                    if (report.steps_to_reproduce?.length) {
+                        descParts.push('\n*Steps to Reproduce:*\n' + report.steps_to_reproduce.map((s: string, i: number) => `${i + 1}. ${s}`).join('\n'));
+                    }
+                    if (report.expected_behavior) descParts.push('\n*Expected:*\n' + report.expected_behavior);
+                    if (report.actual_behavior) descParts.push('\n*Actual:*\n' + report.actual_behavior);
+                    if (report.error_details?.error_message) {
+                        descParts.push('\n*Error:*\n{noformat}' + report.error_details.error_message + '{noformat}');
+                    }
+                    if (report.environment) {
+                        descParts.push('\n*Environment:*\n- Browser: ' + (report.environment.browser || 'chromium') + '\n- URL: ' + (report.environment.url || '') + '\n- Spec: ' + (report.environment.test_spec || ''));
+                    }
+                    setBugReportDescription(descParts.join('\n'));
+                    setBugReportPriority(report.priority || 'P3');
+                    setBugReportLabels(report.suggested_labels || ['bug', 'automated-test']);
+                    setBugReportLoading(false);
+                    setBugReportModal(true);
+                } else if (pollData.status === 'failed') {
+                    setBugReportLoading(false);
+                    alert('Bug report generation failed: ' + (pollData.error || 'Unknown error'));
+                } else {
+                    setTimeout(poll, 2000);
+                }
+            };
+
+            setTimeout(poll, 2000);
+        } catch (e) {
+            setBugReportLoading(false);
+            alert('Failed to start bug report generation');
+        }
+    };
+
+    const handleCreateJiraIssue = async () => {
+        if (!canEdit) return;
+        if (!currentProject?.id || !jiraConfig?.project_key || !jiraConfig?.issue_type_id) return;
+        setCreatingIssue(true);
+
+        try {
+            const pid = encodeURIComponent(currentProject.id);
+            // Map priority name for Jira (P1->Highest, P2->High, P3->Medium, P4->Low)
+            const priorityMap: Record<string, string> = { P1: 'Highest', P2: 'High', P3: 'Medium', P4: 'Low' };
+
+            const res = await fetch(`${API_BASE}/jira/${pid}/create-issue`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    run_id: id,
+                    title: bugReportTitle,
+                    description: bugReportDescription,
+                    project_key: jiraConfig.project_key,
+                    issue_type_id: jiraConfig.issue_type_id,
+                    priority_name: priorityMap[bugReportPriority] || 'Medium',
+                    labels: bugReportLabels,
+                    attach_screenshots: true,
+                }),
+            });
+
+            if (res.ok) {
+                const result = await res.json();
+                setJiraIssue({
+                    exists: true,
+                    jira_issue_key: result.issue_key,
+                    jira_url: result.issue_url,
+                    summary: bugReportTitle,
+                });
+                setBugReportModal(false);
+            } else {
+                const err = await res.json();
+                alert('Failed to create Jira issue: ' + (err.detail || 'Unknown error'));
+            }
+        } catch (e) {
+            alert('Error creating Jira issue');
+        } finally {
+            setCreatingIssue(false);
+        }
+    };
+
+
+    return (
+        <PageLayout tier="standard">
+            <PageHeader
+                title={data.plan?.testName || 'Test Run'}
+                subtitle={`Run ID: ${formatRunId(id)}`}
+                breadcrumb={
+                    <Link href="/runs" className="btn btn-ghost" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', paddingLeft: 0 }}>
+                        <ArrowLeft size={16} /> Back to Runs
+                    </Link>
+                }
+                actions={
+                    <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+                        {canEdit && isRunActive && (
+                            <button
+                                onClick={handleStop}
+                                className="btn btn-danger"
+                                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.9rem', padding: '0.5rem 1rem' }}
+                            >
+                                <Square size={16} fill="currentColor" /> Stop Run
+                            </button>
+                        )}
+                        {runStatus === 'failed' && jiraConfig?.configured && (
+                            jiraIssue?.exists ? (
+                                <a
+                                    href={jiraIssue.jira_url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="btn btn-secondary"
+                                    style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.9rem', padding: '0.5rem 1rem' }}
+                                >
+                                    <ExternalLink size={16} /> {jiraIssue.jira_issue_key}
+                                </a>
+                            ) : canEdit ? (
+                                <button
+                                    onClick={handleGenerateBugReport}
+                                    disabled={bugReportLoading}
+                                    className="btn btn-secondary"
+                                    style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.9rem', padding: '0.5rem 1rem' }}
+                                >
+                                    {bugReportLoading ? (
+                                        <><Loader2 size={16} style={{ animation: 'spin 1s linear infinite' }} /> Generating...</>
+                                    ) : (
+                                        <><Bug size={16} /> Create Bug Report</>
+                                    )}
+                                </button>
+                            ) : null
+                        )}
+                        <div className={`badge badge-${runStatus === 'passed' ? 'success' : runStatus === 'failed' ? 'danger' : 'secondary'}`} style={{ fontSize: '1rem', padding: '0.5rem 1rem' }}>
+                            {runStatus === 'passed' ? 'Passed' :
+                             runStatus === 'failed' ? 'Failed' :
+                             runStatus || 'Unknown Status'}
+                        </div>
+                    </div>
+                }
+            />
+
+            <header className="animate-in stagger-1" style={{ marginBottom: '3rem' }}>
+
+                {/* Run Metadata Bar */}
+                <div style={{
+                    display: 'flex',
+                    gap: '1.5rem',
+                    flexWrap: 'wrap',
+                    padding: '1rem 1.5rem',
+                    background: 'rgba(255,255,255,0.03)',
+                    borderRadius: 'var(--radius)',
+                    border: '1px solid var(--border)'
+                }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <Clock size={16} color="var(--text-secondary)" />
+                        <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Duration:</span>
+                        <span style={{ fontWeight: 600 }}>{data.run?.duration ? `${data.run.duration.toFixed(2)}s` : 'N/A'}</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        {(() => {
+                            const browser = data.run?.browser;
+                            switch (browser) {
+                                case 'firefox':
+                                    return <Globe size={16} color="#FF7139" />;
+                                case 'webkit':
+                                    return <Compass size={16} color="#007AFF" />;
+                                case 'chromium':
+                                default:
+                                    return <Chrome size={16} color="#4285F4" />;
+                            }
+                        })()}
+                        <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Browser:</span>
+                        <span style={{ fontWeight: 600, textTransform: 'capitalize' }}>{data.run?.browser || 'chromium'}</span>
+                    </div>
+                    {data.validation?.status && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            {data.validation.status === 'success' ? <CheckCircle size={16} color="var(--success)" /> : <XCircle size={16} color="var(--danger)" />}
+                            <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Validation:</span>
+                            <span style={{ fontWeight: 600, color: data.validation.status === 'success' ? 'var(--success)' : 'inherit' }}>
+                                {data.validation.status === 'success' ? 'Passed' : data.validation.status}
+                            </span>
+                        </div>
+                    )}
+                    {data.report_url && (
+                        <div style={{ marginLeft: 'auto' }}>
+                            <a
+                                href={`${API_BASE}${data.report_url}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="btn btn-secondary"
+                                style={{ fontSize: '0.85rem', padding: '0.4rem 0.9rem', height: 'auto', display: 'inline-flex', gap: '0.5rem', alignItems: 'center' }}
+                            >
+                                <ExternalLink size={14} /> View HTML Report
+                            </a>
+                        </div>
+                    )}
+                </div>
+
+                {/* Error Message Banner */}
+                {(runStatus === 'error' || runStatus === 'failed' || runStatus === 'stopped') && (data.run?.error_message || data.error_message) && (
+                    <div style={{
+                        marginTop: '1.5rem',
+                        padding: '1rem 1.25rem',
+                        background: runStatus === 'stopped' ? 'rgba(251, 191, 36, 0.08)' : 'rgba(239, 68, 68, 0.08)',
+                        border: `1px solid ${runStatus === 'stopped' ? 'rgba(251, 191, 36, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+                        borderRadius: 'var(--radius)',
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        gap: '0.75rem'
+                    }}>
+                        <XCircle size={20} style={{ color: runStatus === 'stopped' ? 'var(--warning)' : 'var(--danger)', flexShrink: 0, marginTop: '2px' }} />
+                        <div style={{ flex: 1 }}>
+                            <div style={{ fontWeight: 600, marginBottom: '0.25rem', color: runStatus === 'stopped' ? 'var(--warning)' : 'var(--danger)' }}>
+                                {runStatus === 'error' ? 'Pipeline Error' : runStatus === 'failed' ? 'Test Failed' : 'Run Stopped'}
+                            </div>
+                            <div style={{
+                                fontFamily: 'var(--font-mono)',
+                                fontSize: '0.85rem',
+                                lineHeight: 1.5,
+                                color: 'var(--text)',
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-word'
+                            }}>
+                                {data.run?.error_message || data.error_message}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {data.run?.notes?.some((note: string) => note.includes('Reused existing code')) && (
+                    <div style={{
+                        marginTop: '1.5rem',
+                        padding: '1rem',
+                        background: 'var(--success-muted)',
+                        border: '1px solid rgba(52, 211, 153, 0.3)',
+                        borderRadius: 'var(--radius)',
+                        color: 'var(--success)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.75rem'
+                    }}>
+                        <CheckCircle size={20} />
+                        <div>
+                            <strong>Smart Run Active:</strong> Reused existing test code.
+                        </div>
+                    </div>
+                )}
+            </header>
+
+            <div className="animate-in stagger-2" style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+
+                    <section className="card">
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', alignItems: 'flex-start', marginBottom: '1rem', flexWrap: 'wrap' }}>
+                            <h2 style={{ fontSize: '1.25rem', margin: 0, display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600 }}>
+                                <Wrench size={20} /> Run Progress Debug
+                            </h2>
+                            {runHealth.stuck_warning && (
+                                <div style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '0.45rem',
+                                    padding: '0.45rem 0.7rem',
+                                    border: '1px solid rgba(245, 158, 11, 0.45)',
+                                    background: 'rgba(245, 158, 11, 0.10)',
+                                    borderRadius: 'var(--radius)',
+                                    color: 'var(--warning)',
+                                    fontSize: '0.82rem',
+                                    fontWeight: 700,
+                                    maxWidth: '100%',
+                                }}>
+                                    <AlertTriangle size={15} /> {runHealth.stuck_warning}
+                                </div>
+                            )}
+                        </div>
+
+                        <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))',
+                            gap: '0.75rem',
+                            marginBottom: '1rem',
+                        }}>
+                            {[
+                                ['Stage age', formatAge(runHealth.stage_age_seconds)],
+                                ['Last log update', formatAge(runHealth.last_log_age_seconds)],
+                                ['Last artifact update', formatAge(runHealth.last_artifact_age_seconds)],
+                                ['Recent output', runHealth.has_recent_output ? 'Yes' : 'No'],
+                                ['Agent messages', agentProgress.messages_received !== undefined ? String(agentProgress.messages_received) : 'Unknown'],
+                                ['Parsed output', agentProgress.messages_received !== undefined ? `${agentProgress.text_blocks_received ?? 0} text, ${agentProgress.tool_calls ?? 0} tools, ${agentProgress.output_chars ?? 0} chars` : 'Unknown'],
+                                ['Stream health', agentProgress.unproductive_stream ? 'Unproductive' : (agentProgress.status || agentProgress.phase || 'Unknown')],
+                                ['Temporal activity', activeTemporalActivities.length > 0 ? activeTemporalActivities.map((activity: any) => activity.activity_type || activity.activity_id || 'activity').join(', ') : (temporalDiagnostics.workflow_status || 'None')],
+                                ['Worker pollers', temporalPollers ? `${temporalPollers.workflow_pollers ?? 0} workflow, ${temporalPollers.activity_pollers ?? 0} activity` : 'Unknown'],
+                                ['Browser slot owner', browserSlotOwner || 'None'],
+                                ['Browser blocker', data.blocker_message || browserPoolDiagnostics.blocker || 'None'],
+                            ].map(([label, value]) => (
+                                <div key={label} style={{ padding: '0.75rem', border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: 'var(--surface-hover)', minWidth: 0 }}>
+                                    <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0, marginBottom: '0.3rem' }}>{label}</div>
+                                    <div style={{ fontWeight: 700, overflowWrap: 'anywhere' }}>{value}</div>
+                                </div>
+                            ))}
+                        </div>
+
+                        {(runHealth.warnings || []).length > 1 && (
+                            <div style={{ display: 'grid', gap: '0.4rem', marginBottom: '1rem' }}>
+                                {(runHealth.warnings || []).slice(1).map((warning, index) => (
+                                    <div key={`${warning}-${index}`} style={{ color: 'var(--warning)', fontSize: '0.86rem', display: 'flex', alignItems: 'flex-start', gap: '0.45rem' }}>
+                                        <AlertTriangle size={14} style={{ marginTop: '0.12rem', flexShrink: 0 }} /> <span>{warning}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        {(temporalDiagnostics.workflow_status || temporalDiagnostics.error || activeTemporalActivities.length > 0) && (
+                            <details style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: 'var(--background)', overflow: 'hidden', marginBottom: linkedAgentRun ? '1rem' : 0 }}>
+                                <summary style={{ cursor: 'pointer', padding: '0.65rem 0.8rem', fontWeight: 700, fontSize: '0.85rem' }}>Temporal diagnostics</summary>
+                                <pre style={{ margin: 0, padding: '0.8rem', borderTop: '1px solid var(--border)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                                    {JSON.stringify({
+                                        workflow_status: temporalDiagnostics.workflow_status,
+                                        task_queue: temporalDiagnostics.task_queue,
+                                        task_queue_status: temporalDiagnostics.task_queue_status,
+                                        history_last_event_at: temporalDiagnostics.history_last_event_at,
+                                        activities: (temporalDiagnostics.activities || []).slice(-5),
+                                        error: temporalDiagnostics.error,
+                                    }, null, 2)}
+                                </pre>
+                            </details>
+                        )}
+
+                        {agentProgress.messages_received !== undefined && (
+                            <details style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: 'var(--background)', overflow: 'hidden', marginBottom: linkedAgentRun ? '1rem' : 0 }}>
+                                <summary style={{ cursor: 'pointer', padding: '0.65rem 0.8rem', fontWeight: 700, fontSize: '0.85rem' }}>Agent progress</summary>
+                                <pre style={{ margin: 0, padding: '0.8rem', borderTop: '1px solid var(--border)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                                    {JSON.stringify(agentProgress, null, 2)}
+                                </pre>
+                            </details>
+                        )}
+
+                        {linkedAgentRun && (
+                            <div style={{ marginTop: '1rem' }}>
+                                <div style={{ marginBottom: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                    <div style={{ fontSize: '0.9rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                        <Wrench size={16} /> Linked Tool Activity
+                                    </div>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', minWidth: 0, color: 'var(--text-secondary)', fontSize: '0.78rem' }}>
+                                        <span style={{ fontWeight: 700, color: 'var(--text)' }}>{linkedNotesSummary.count}</span>
+                                        <span>{linkedNotesSummary.count === 1 ? 'note' : 'notes'}</span>
+                                        {linkedNotesSummary.latest && (
+                                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '420px' }}>
+                                                Latest: {linkedNotesSummary.latest.title}
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+                                <AgentRunObservabilityPanel
+                                    run={linkedAgentRun}
+                                    events={linkedAgentEvents}
+                                    supplementalNotes={supplementalLinkedAgentNotes}
+                                    trace={linkedAgentTrace}
+                                    traceLoading={linkedAgentTraceLoading}
+                                    activeTraceTab="notes"
+                                    onExportTrace={exportLinkedAgentTrace}
+                                />
+                            </div>
+                        )}
+                    </section>
+
+                    {/* Visual Regression Section */}
+                    {visualDiffs.length > 0 && (
+                        <section className="card">
+                            <h2 style={{ fontSize: '1.25rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600 }}>
+                                <Eye size={20} className="text-primary" /> Visual Regression Failures
+                            </h2>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+                                {visualDiffs.map((diff, i) => (
+                                    <div key={i} style={{ background: 'var(--background)', padding: '1rem', borderRadius: 'var(--radius)' }}>
+                                        <h3 style={{ fontSize: '1rem', marginBottom: '1rem', fontWeight: 600 }}>{diff.name}</h3>
+                                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
+                                            {diff.expected && (
+                                                <div>
+                                                    <div style={{ marginBottom: '0.5rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Expected</div>
+                                                    <a href={`${API_BASE}${diff.expected.path}`} target="_blank" rel="noreferrer">
+                                                        <img src={`${API_BASE}${diff.expected.path}`} alt={`${diff.name} expected screenshot`} style={{ width: '100%', borderRadius: '4px', border: '1px solid var(--border)' }} />
+                                                    </a>
+                                                </div>
+                                            )}
+                                            {diff.actual && (
+                                                <div>
+                                                    <div style={{ marginBottom: '0.5rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Actual</div>
+                                                    <a href={`${API_BASE}${diff.actual.path}`} target="_blank" rel="noreferrer">
+                                                        <img src={`${API_BASE}${diff.actual.path}`} alt={`${diff.name} actual screenshot`} style={{ width: '100%', borderRadius: '4px', border: '1px solid var(--border)' }} />
+                                                    </a>
+                                                </div>
+                                            )}
+                                            {diff.diff && (
+                                                <div>
+                                                    <div style={{ marginBottom: '0.5rem', fontSize: '0.8rem', color: 'var(--danger)' }}>Diff</div>
+                                                    <a href={`${API_BASE}${diff.diff.path}`} target="_blank" rel="noreferrer">
+                                                        <img src={`${API_BASE}${diff.diff.path}`} alt={`${diff.name} visual diff`} style={{ width: '100%', borderRadius: '4px', border: '1px solid var(--danger)' }} />
+                                                    </a>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </section>
+                    )}
+
+                    <section className="card">
+                        <h2 style={{ fontSize: '1.25rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600 }}>
+                            <Layout size={20} /> Execution Plan
+                        </h2>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            {data.plan?.steps?.map((step: any, i: number) => (
+                                <div key={i} style={{
+                                    padding: '1rem',
+                                    background: 'var(--surface-hover)',
+                                    borderRadius: 'var(--radius)',
+                                    borderLeft: '4px solid var(--primary)'
+                                }}>
+                                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>Step {i + 1}</div>
+                                    <div style={{ lineHeight: 1.5 }}>{step.description}</div>
+                                    <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '0.5rem', fontFamily: 'monospace', background: 'rgba(0,0,0,0.2)', padding: '0.25rem', display: 'inline-block', borderRadius: '4px' }}>
+                                        {step.action} {step.params?.selector || step.params?.url || ''}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </section>
+
+                    <section className="card">
+                        <h2 style={{ fontSize: '1.25rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600 }}>
+                            <Code size={20} /> Generated Code
+                        </h2>
+                        {data.export?.testFilePath && (
+                            <div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                                    <p style={{ margin: 0, fontSize: '0.9rem' }}>File: <code style={{ background: 'var(--surface-hover)', padding: '0.2rem 0.5rem', borderRadius: '4px', fontFamily: 'var(--font-mono)' }}>{data.export.testFilePath}</code></p>
+                                    <button
+                                        className="btn btn-secondary"
+                                        onClick={() => {
+                                            if (data.generated_code) {
+                                                navigator.clipboard.writeText(data.generated_code);
+                                                setCopied(true);
+                                                setTimeout(() => setCopied(false), 2000);
+                                            }
+                                        }}
+                                        style={{ fontSize: '0.8rem', padding: '0.35rem 0.75rem', height: 'auto' }}
+                                    >
+                                        {copied ? <><Check size={14} /> Copied</> : <><Copy size={14} /> Copy</>}
+                                    </button>
+                                </div>
+                                <div style={{
+                                    borderRadius: 'var(--radius)',
+                                    overflow: 'hidden',
+                                    border: '1px solid var(--border)'
+                                }}>
+                                    <SyntaxHighlighter
+                                        language="typescript"
+                                        style={vscDarkPlus}
+                                        customStyle={{ margin: 0, padding: '1.5rem', fontSize: '0.9rem', background: 'var(--background)' }}
+                                        showLineNumbers={true}
+                                    >
+                                        {data.generated_code || '// Code content not available'}
+                                    </SyntaxHighlighter>
+                                </div>
+                            </div>
+                        )}
+                    </section>
+
+                    {/* Live View / Execution Log Section */}
+                    <section className="card">
+                        {/* Section Header with View Toggle */}
+                        <div style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            marginBottom: '1rem'
+                        }}>
+                            <h2 style={{ fontSize: '1.25rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600, margin: 0 }}>
+                                {viewMode === 'browser' ? (
+                                    <><Monitor size={20} /> Live Browser View</>
+                                ) : (
+                                    <><FileText size={20} /> Execution Log</>
+                                )}
+                                {isStreaming && (
+                                    <span style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: '0.5rem',
+                                        padding: '0.25rem 0.75rem',
+                                        borderRadius: '999px',
+                                        fontSize: '0.75rem',
+                                        fontWeight: 600,
+                                        background: 'var(--primary-glow)',
+                                        color: 'var(--primary)',
+                                        border: '1px solid rgba(59, 130, 246, 0.25)'
+                                    }}>
+                                        <span style={{
+                                            width: '8px',
+                                            height: '8px',
+                                            borderRadius: '50%',
+                                            background: 'var(--primary)',
+                                            animation: 'pulse 1s ease-in-out infinite'
+                                        }} />
+                                        Live
+                                    </span>
+                                )}
+                            </h2>
+
+                            {/* View Mode Toggle */}
+                            <div style={{
+                                display: 'flex',
+                                gap: '0.25rem',
+                                background: 'var(--surface-hover)',
+                                padding: '0.25rem',
+                                borderRadius: 'var(--radius)'
+                            }}>
+                                <button
+                                    onClick={() => setViewMode('browser')}
+                                    title={isRunActive ? 'Live browser view' : 'Browser view is only available while a run is active'}
+                                    style={{
+                                        padding: '0.4rem 0.75rem',
+                                        borderRadius: 'calc(var(--radius) - 2px)',
+                                        border: 'none',
+                                        background: viewMode === 'browser' ? 'var(--primary)' : 'transparent',
+                                        color: viewMode === 'browser' ? 'white' : 'var(--text-secondary)',
+                                        fontSize: '0.8rem',
+                                        fontWeight: 500,
+                                        cursor: 'pointer',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '0.4rem',
+                                        transition: 'all 0.15s ease',
+                                        opacity: isRunActive ? 1 : 0.65
+                                    }}
+                                >
+                                    <Monitor size={14} /> Browser
+                                    {!isRunActive && (
+                                        <span style={{
+                                            fontSize: '0.65rem',
+                                            padding: '0.1rem 0.3rem',
+                                            background: 'rgba(251, 191, 36, 0.2)',
+                                            color: 'var(--warning)',
+                                            borderRadius: '3px',
+                                            marginLeft: '0.2rem'
+                                        }}>
+                                            Idle
+                                        </span>
+                                    )}
+                                </button>
+                                <button
+                                    onClick={() => setViewMode('log')}
+                                    style={{
+                                        padding: '0.4rem 0.75rem',
+                                        borderRadius: 'calc(var(--radius) - 2px)',
+                                        border: 'none',
+                                        background: viewMode === 'log' ? 'var(--primary)' : 'transparent',
+                                        color: viewMode === 'log' ? 'white' : 'var(--text-secondary)',
+                                        fontSize: '0.8rem',
+                                        fontWeight: 500,
+                                        cursor: 'pointer',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '0.4rem',
+                                        transition: 'all 0.15s ease'
+                                    }}
+                                >
+                                    <FileText size={14} /> Log
+                                </button>
+                            </div>
+                        </div>
+
+                        <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                            gap: '0.75rem',
+                            padding: '0.85rem 1rem',
+                            marginBottom: '1rem',
+                            background: 'var(--surface-hover)',
+                            border: '1px solid var(--border)',
+                            borderRadius: 'var(--radius)'
+                        }}>
+                            <div>
+                                <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0, marginBottom: '0.25rem' }}>Status</div>
+                                <div style={{ fontWeight: 700, textTransform: 'capitalize' }}>{runStatus.replace(/_/g, ' ')}</div>
+                            </div>
+                            {statusDetails.length > 0 ? statusDetails.map(([label, value]) => (
+                                <div key={label}>
+                                    <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0, marginBottom: '0.25rem' }}>{label}</div>
+                                    <div style={{ fontWeight: 600, overflowWrap: 'anywhere' }}>{value}</div>
+                                </div>
+                            )) : (
+                                <div>
+                                    <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0, marginBottom: '0.25rem' }}>Progress</div>
+                                    <div style={{ fontWeight: 600 }}>Waiting for run output</div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Live Browser View */}
+                        {viewMode === 'browser' && (
+                            <LiveBrowserView
+                                runId={id}
+                                isActive={isRunActive}
+                                onShowLog={() => setViewMode('log')}
+                                artifacts={standardArtifacts}
+                                latestImage={latestImageArtifact}
+                                statusMessage={data.stage_message}
+                                liveViewAvailable={Boolean(data.live_view_available)}
+                                runtimeMessage={data.runtime_message}
+                                vncUrl={data.vnc_url}
+                                displayDiagnostics={data.display_diagnostics}
+                            />
+                        )}
+
+                        {/* Execution Log */}
+                        {viewMode === 'log' && (
+                            <div style={{ position: 'relative' }}>
+                                <div
+                                    ref={logPanelRef}
+                                    onScroll={updateLogPinnedState}
+                                    style={{
+                                        background: 'var(--background)',
+                                        padding: shouldShowStructuredLogs ? '0.75rem' : '1rem',
+                                        borderRadius: 'var(--radius)',
+                                        maxHeight: '500px',
+                                        overflow: 'auto',
+                                        color: 'var(--text)',
+                                        border: `1px solid ${isStreaming ? 'var(--primary)' : 'var(--border)'}`,
+                                        transition: 'border-color 0.3s'
+                                    }}
+                                >
+                                    {shouldShowStructuredLogs ? (
+                                        <div style={{ display: 'grid', gap: '0.75rem' }}>
+                                            {data.blocker_message && (
+                                                <div style={{
+                                                    padding: '0.75rem',
+                                                    border: '1px solid rgba(245, 158, 11, 0.45)',
+                                                    background: 'rgba(245, 158, 11, 0.10)',
+                                                    borderRadius: 'var(--radius)',
+                                                    fontSize: '0.86rem',
+                                                    fontWeight: 650,
+                                                    color: 'var(--text)'
+                                                }}>
+                                                    {data.blocker_message}
+                                                </div>
+                                            )}
+                                            {logSections.map((section: any, index: number) => (
+                                                <section key={`${section.source || 'log'}-${index}`} style={{
+                                                    border: '1px solid var(--border)',
+                                                    borderRadius: 'var(--radius)',
+                                                    overflow: 'hidden',
+                                                    background: 'var(--surface)'
+                                                }}>
+                                                    <div style={{
+                                                        display: 'flex',
+                                                        justifyContent: 'space-between',
+                                                        gap: '0.75rem',
+                                                        padding: '0.55rem 0.75rem',
+                                                        borderBottom: '1px solid var(--border)',
+                                                        background: 'var(--surface-hover)',
+                                                        fontSize: '0.78rem',
+                                                        fontWeight: 700
+                                                    }}>
+                                                        <span>{section.title || 'Log'}</span>
+                                                        <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>{section.source}</span>
+                                                    </div>
+                                                    <pre style={{
+                                                        margin: 0,
+                                                        padding: '0.75rem',
+                                                        whiteSpace: 'pre-wrap',
+                                                        overflowWrap: 'anywhere',
+                                                        fontFamily: 'monospace',
+                                                        fontSize: '0.82rem',
+                                                        lineHeight: 1.45,
+                                                        color: 'var(--text)'
+                                                    }}>
+                                                        {section.content || 'No entries yet.'}
+                                                    </pre>
+                                                </section>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <pre style={{
+                                            margin: 0,
+                                            fontFamily: 'monospace',
+                                            fontSize: '0.85rem',
+                                            whiteSpace: 'pre-wrap',
+                                            overflowWrap: 'anywhere',
+                                            color: 'var(--text)'
+                                        }}>
+                                            {isStreaming ? (streamingLog || data.log || 'Waiting for output...') : (data.log || 'No logs available.')}
+                                        </pre>
+                                    )}
+                                </div>
+                                {!isLogPinnedToBottom && (
+                                    <button
+                                        type="button"
+                                        onClick={jumpToLatestLog}
+                                        style={{
+                                            position: 'absolute',
+                                            right: '0.85rem',
+                                            bottom: '0.85rem',
+                                            border: '1px solid var(--border)',
+                                            borderRadius: '999px',
+                                            background: 'var(--surface)',
+                                            color: 'var(--text)',
+                                            boxShadow: '0 8px 24px rgba(0,0,0,0.28)',
+                                            padding: '0.4rem 0.7rem',
+                                            fontSize: '0.78rem',
+                                            fontWeight: 700,
+                                            cursor: 'pointer'
+                                        }}
+                                    >
+                                        Jump to latest
+                                    </button>
+                                )}
+                            </div>
+                        )}
+
+                        <style jsx>{`
+                            @keyframes pulse {
+                                0%, 100% { opacity: 1; }
+                                50% { opacity: 0.5; }
+                            }
+                        `}</style>
+                    </section>
+
+                    {(videoArtifacts.length > 0 || isRunFinished) && (
+                        <section className="card">
+                            <h2 style={{ fontSize: '1.25rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600 }}>
+                                <VideoIcon size={20} /> Run Recording
+                            </h2>
+                            {videoArtifacts.length > 0 ? (
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '1rem' }}>
+                                    {videoArtifacts.map((art: Artifact, i: number) => (
+                                        <div key={i} style={{ borderRadius: 'var(--radius)', overflow: 'hidden', background: 'var(--background)', border: '1px solid var(--border)' }}>
+                                            <video
+                                                controls
+                                                preload="metadata"
+                                                src={`${API_BASE}${art.path}`}
+                                                style={{ width: '100%', display: 'block', aspectRatio: '16/9', background: '#000' }}
+                                            />
+                                            <div style={{ padding: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+                                                <span style={{ minWidth: 0, fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                                    {art.name}
+                                                </span>
+                                                <a href={`${API_BASE}${art.path}`} target="_blank" rel="noreferrer" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', color: 'var(--primary)', fontSize: '0.8rem', textDecoration: 'none', flexShrink: 0 }}>
+                                                    Open <ExternalLink size={13} />
+                                                </a>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <div style={{ border: '1px dashed var(--border)', borderRadius: 'var(--radius)', padding: '1rem', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+                                    No video artifact was captured for this run. New runs will record video automatically.
+                                </div>
+                            )}
+                        </section>
+                    )}
+
+                    {imageArtifacts.length > 0 && (
+                        <section className="card">
+                            <h2 style={{ fontSize: '1.25rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600 }}>
+                                <ImageIcon size={20} /> Other Artifacts
+                            </h2>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '1rem' }}>
+                                {imageArtifacts.map((art: Artifact, i: number) => (
+                                    <div key={i} style={{ borderRadius: 'var(--radius)', overflow: 'hidden', background: 'var(--background)', border: '1px solid var(--border)' }}>
+                                        <a href={`${API_BASE}${art.path}`} target="_blank" rel="noreferrer">
+                                            <img
+                                                src={`${API_BASE}${art.path}`}
+                                                alt={art.name}
+                                                style={{ width: '100%', aspectRatio: '16/9', objectFit: 'cover' }}
+                                            />
+                                        </a>
+                                        <div style={{ padding: '0.5rem', fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                            {art.name}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </section>
+                    )}
+
+                </div>
+
+            </div>
+
+            {/* Bug Report Modal */}
+            {canEdit && bugReportModal && (
+                <div style={{
+                    position: 'fixed',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    background: 'rgba(0, 0, 0, 0.7)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    zIndex: 1000,
+                    padding: '2rem',
+                }}>
+                    <div style={{
+                        background: 'var(--surface)',
+                        borderRadius: 'var(--radius)',
+                        border: '1px solid var(--border)',
+                        maxWidth: '700px',
+                        width: '100%',
+                        maxHeight: '90vh',
+                        overflow: 'auto',
+                        padding: '2rem',
+                    }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+                            <h2 style={{ fontSize: '1.5rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0 }}>
+                                <Bug size={24} /> Create Bug Report
+                            </h2>
+                            <button
+                                onClick={() => setBugReportModal(false)}
+                                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', padding: '0.25rem' }}
+                            >
+                                <X size={20} />
+                            </button>
+                        </div>
+
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+                            {/* Title */}
+                            <div className="form-group">
+                                <label className="label">Title</label>
+                                <input
+                                    type="text"
+                                    value={bugReportTitle}
+                                    onChange={e => setBugReportTitle(e.target.value)}
+                                    className="input"
+                                    style={{ width: '100%' }}
+                                />
+                            </div>
+
+                            {/* Description */}
+                            <div className="form-group">
+                                <label className="label">Description</label>
+                                <textarea
+                                    value={bugReportDescription}
+                                    onChange={e => setBugReportDescription(e.target.value)}
+                                    style={{
+                                        width: '100%',
+                                        minHeight: '250px',
+                                        padding: '0.75rem',
+                                        borderRadius: 'var(--radius)',
+                                        border: '1px solid var(--border)',
+                                        background: 'var(--surface-hover)',
+                                        color: 'var(--text-primary)',
+                                        fontFamily: 'var(--font-mono)',
+                                        fontSize: '0.875rem',
+                                        resize: 'vertical',
+                                    }}
+                                />
+                            </div>
+
+                            {/* Priority */}
+                            <div className="form-group">
+                                <label className="label">Priority</label>
+                                <select
+                                    value={bugReportPriority}
+                                    onChange={e => setBugReportPriority(e.target.value)}
+                                    className="input"
+                                    style={{ width: '200px' }}
+                                >
+                                    <option value="P1">P1 - Blocker</option>
+                                    <option value="P2">P2 - Critical</option>
+                                    <option value="P3">P3 - Major</option>
+                                    <option value="P4">P4 - Minor</option>
+                                </select>
+                            </div>
+
+                            {/* Labels */}
+                            <div className="form-group">
+                                <label className="label">Labels</label>
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                                    {bugReportLabels.map((label, i) => (
+                                        <span key={i} style={{
+                                            padding: '0.25rem 0.75rem',
+                                            borderRadius: '999px',
+                                            background: 'var(--primary-glow)',
+                                            color: 'var(--primary)',
+                                            fontSize: '0.8rem',
+                                            fontWeight: 500,
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '0.4rem',
+                                        }}>
+                                            {label}
+                                            <button
+                                                onClick={() => setBugReportLabels(prev => prev.filter((_, j) => j !== i))}
+                                                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--primary)', padding: 0, lineHeight: 1 }}
+                                            >
+                                                <X size={12} />
+                                            </button>
+                                        </span>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Screenshots note */}
+                            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', margin: 0 }}>
+                                Screenshots from the test run will be automatically attached to the Jira issue.
+                            </p>
+
+                            {/* Actions */}
+                            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', paddingTop: '1rem', borderTop: '1px solid var(--border)' }}>
+                                <button
+                                    onClick={() => setBugReportModal(false)}
+                                    className="btn"
+                                    style={{ background: 'transparent', border: '1px solid var(--border)' }}
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={handleCreateJiraIssue}
+                                    disabled={creatingIssue || !bugReportTitle || !jiraConfig?.project_key || !jiraConfig?.issue_type_id}
+                                    className="btn btn-primary"
+                                    style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', opacity: creatingIssue ? 0.7 : 1 }}
+                                >
+                                    {creatingIssue ? (
+                                        <><Loader2 size={16} style={{ animation: 'spin 1s linear infinite' }} /> Creating...</>
+                                    ) : (
+                                        <><ExternalLink size={16} /> Create in Jira</>
+                                    )}
+                                </button>
+                            </div>
+
+                            {!jiraConfig?.project_key && (
+                                <p style={{ fontSize: '0.85rem', color: 'var(--danger)', margin: 0 }}>
+                                    Please configure a default Jira project in Settings first.
+                                </p>
+                            )}
+                        </div>
+
+                        <style jsx>{`
+                            @keyframes spin {
+                                from { transform: rotate(0deg); }
+                                to { transform: rotate(360deg); }
+                            }
+                        `}</style>
+                    </div>
+                </div>
+            )}
+        </PageLayout>
+    );
+}

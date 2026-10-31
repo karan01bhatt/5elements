@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussion
+    url: https://github.com/NihadMemmedli/quorvex_ai/discussions
+    about: Ask questions, share ideas, or show what you've built
+  - name: Documentation
+    url: https://nihadmemmedli.github.io/quorvex_ai/
+    about: Check the docs before opening an issue
+  - name: Security report
+    url: https://github.com/NihadMemmedli/quorvex_ai/security/advisories/new
+    about: Please report vulnerabilities privately instead of opening a public issue

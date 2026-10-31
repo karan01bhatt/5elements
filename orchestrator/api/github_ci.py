@@ -1,0 +1,1527 @@
+"""
+GitHub Actions CI/CD Integration API - Config, connection test, workflow triggers, webhooks.
+
+Stores GitHub credentials in Project.settings["integrations"]["github"]
+with encrypted token and webhook secret. Supports triggering workflows,
+tracking pipeline runs, and receiving webhook events.
+"""
+
+import logging
+import uuid
+from datetime import datetime
+from typing import Any
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import Session, select
+
+from orchestrator.services.quality_gate import (
+    DEFAULT_QUALITY_GATE_CONFIG,
+    batch_payload,
+    ci_status_payload,
+    get_quality_gate_config,
+    publish_quality_gate_feedback,
+    quality_gate_app_url,
+    quality_gate_comment,
+    quality_gate_status,
+    serialize_quality_gate,
+    sync_gate_run_state,
+)
+
+from .credentials import decrypt_credential, encrypt_credential, mask_credential
+from .db import get_session
+from .middleware.auth import get_current_user_optional
+from .models_auth import User
+from .models_db import (
+    CiPipelineMapping,
+    PrImpactAnalysis,
+    Project,
+    PrQualityGateRun,
+    PrSelectedTest,
+    RegressionBatch,
+    RepoIndexSnapshot,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/github", tags=["github"])
+
+
+# -- Request / Response Models ------------------------------------
+
+
+class GithubConfigRequest(BaseModel):
+    owner: str
+    repo: str | None = ""  # Optional for initial setup (save owner+token first, pick repo later)
+    token: str | None = None  # None means keep existing
+    default_workflow: str | None = None
+    default_ref: str | None = None
+    webhook_secret: str | None = None  # None means keep existing
+    quality_gate: dict[str, Any] | None = None
+
+
+class TriggerWorkflowRequest(BaseModel):
+    workflow_id: str | None = None  # Falls back to default_workflow
+    ref: str | None = None  # Falls back to default_ref
+    inputs: dict[str, str] | None = None
+
+
+class SyncRunsRequest(BaseModel):
+    workflow_id: str | None = None  # None = fetch all workflows
+    per_page: int = 20
+
+
+class PrAdvisorAnalyzeRequest(BaseModel):
+    pr_number: int
+    ensure_indexed: bool = True
+    force_reindex: bool = False
+
+
+class PrAdvisorRunRequest(BaseModel):
+    browser: str = "chromium"
+    hybrid: bool = False
+    max_iterations: int = 20
+    spec_names: list[str] | None = None
+
+
+class PrQualityGateStartRequest(BaseModel):
+    pr_number: int
+    head_sha: str | None = None
+    ensure_indexed: bool | None = None
+    force_reindex: bool | None = None
+    run_recommended: bool | None = None
+    post_feedback: bool | None = None
+    create_commit_status: bool | None = None
+    browser: str | None = None
+    hybrid: bool | None = None
+    max_iterations: int | None = None
+
+
+class PrQualityGateConfigRequest(BaseModel):
+    enabled: bool = True
+    ensure_indexed: bool = True
+    run_recommended: bool = True
+    post_feedback: bool = True
+    create_commit_status: bool = True
+    force_reindex: bool = False
+    require_full_suite_on_low_confidence: bool = True
+    allow_empty_selection: bool = False
+    default_browser: str = "chromium"
+    hybrid: bool = False
+    max_iterations: int = 20
+    timeout_minutes: int = 120
+
+
+class RepositoryIndexRequest(BaseModel):
+    ref: str | None = None
+    force: bool = False
+
+
+# -- Helpers -------------------------------------------------------
+
+
+def _get_github_config(project: Project) -> dict[str, Any] | None:
+    """Read the GitHub config block from project settings."""
+    if not project.settings:
+        return None
+    return (project.settings.get("integrations") or {}).get("github")
+
+
+def _save_github_config(project: Project, config: dict[str, Any], session: Session):
+    """Write the GitHub config block into project settings and persist."""
+    if not project.settings:
+        project.settings = {}
+    integrations = project.settings.setdefault("integrations", {})
+    integrations["github"] = config
+    flag_modified(project, "settings")
+    session.add(project)
+    session.commit()
+
+
+def _require_project(project_id: str, session: Session) -> Project:
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+async def _build_client(project: Project):
+    """Build a GithubClient from the project config. Raises 400 if not configured."""
+    from services.github_client import GithubClient
+
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+
+    token = decrypt_credential(config.get("token_encrypted", ""))
+    if not token:
+        raise HTTPException(status_code=400, detail="GitHub token could not be decrypted")
+
+    return GithubClient(token=token)
+
+
+# -- Config Endpoints ----------------------------------------------
+
+
+@router.get("/{project_id}/config")
+def get_config(
+    project_id: str,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Get GitHub config for a project (token masked)."""
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        return {"configured": False}
+
+    token = decrypt_credential(config.get("token_encrypted", ""))
+    webhook_secret = decrypt_credential(config.get("webhook_secret_encrypted", ""))
+
+    return {
+        "configured": True,
+        "owner": config.get("owner", ""),
+        "repo": config.get("repo", ""),
+        "token_masked": mask_credential(token),
+        "default_workflow": config.get("default_workflow"),
+        "default_ref": config.get("default_ref"),
+        "webhook_secret_masked": mask_credential(webhook_secret) if webhook_secret else None,
+        "quality_gate": get_quality_gate_config(project),
+    }
+
+
+@router.post("/{project_id}/config")
+def save_config(
+    project_id: str,
+    request: GithubConfigRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Save GitHub config for a project."""
+    project = _require_project(project_id, session)
+
+    if not request.owner:
+        raise HTTPException(status_code=400, detail="owner is required")
+
+    existing = _get_github_config(project)
+
+    # Handle token encryption
+    if request.token:
+        token_encrypted = encrypt_credential(request.token)
+    elif existing and existing.get("token_encrypted"):
+        token_encrypted = existing["token_encrypted"]
+    else:
+        raise HTTPException(status_code=400, detail="Token is required for initial setup")
+
+    # Handle webhook secret encryption
+    webhook_secret_encrypted = None
+    if request.webhook_secret:
+        webhook_secret_encrypted = encrypt_credential(request.webhook_secret)
+    elif existing and existing.get("webhook_secret_encrypted"):
+        webhook_secret_encrypted = existing["webhook_secret_encrypted"]
+
+    config = {
+        "owner": request.owner,
+        "repo": request.repo or "",
+        "token_encrypted": token_encrypted,
+        "default_workflow": request.default_workflow,
+        "default_ref": request.default_ref or "main",
+        "webhook_secret_encrypted": webhook_secret_encrypted,
+        "quality_gate": request.quality_gate or (existing or {}).get("quality_gate") or DEFAULT_QUALITY_GATE_CONFIG,
+    }
+    _save_github_config(project, config, session)
+    return {"status": "ok"}
+
+
+@router.delete("/{project_id}/config")
+def delete_config(
+    project_id: str,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Remove GitHub config from a project."""
+    project = _require_project(project_id, session)
+    if project.settings and "integrations" in project.settings:
+        project.settings["integrations"].pop("github", None)
+        flag_modified(project, "settings")
+        session.add(project)
+        session.commit()
+    return {"status": "ok"}
+
+
+@router.get("/{project_id}/quality-gates/config")
+def get_quality_gate_settings(
+    project_id: str,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Get GitHub PR quality gate defaults for a project."""
+    project = _require_project(project_id, session)
+    return get_quality_gate_config(project)
+
+
+@router.put("/{project_id}/quality-gates/config")
+def save_quality_gate_settings(
+    project_id: str,
+    request: PrQualityGateConfigRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Save GitHub PR quality gate defaults for a project."""
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+    quality_gate = {**DEFAULT_QUALITY_GATE_CONFIG, **request.model_dump()}
+    if quality_gate["default_browser"] not in {"chromium", "firefox", "webkit"}:
+        raise HTTPException(status_code=400, detail="default_browser must be chromium, firefox, or webkit")
+    quality_gate["max_iterations"] = max(1, min(int(quality_gate["max_iterations"]), 100))
+    quality_gate["timeout_minutes"] = max(5, min(int(quality_gate["timeout_minutes"]), 720))
+    config["quality_gate"] = quality_gate
+    _save_github_config(project, config, session)
+    return quality_gate
+
+
+# -- Connection Test -----------------------------------------------
+
+
+@router.post("/{project_id}/test-connection")
+async def test_connection(
+    project_id: str,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Test the GitHub connection using stored credentials."""
+    project = _require_project(project_id, session)
+    client = await _build_client(project)
+    try:
+        user_info = await client.test_connection()
+        return {
+            "status": "ok",
+            "user": user_info.get("login", "Unknown"),
+            "name": user_info.get("name"),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Connection failed: {e}")
+    finally:
+        await client.close()
+
+
+# -- Remote Browse -------------------------------------------------
+
+
+@router.get("/{project_id}/remote-repos")
+async def list_remote_repos(
+    project_id: str,
+    search: str | None = None,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """List GitHub repositories accessible with stored credentials."""
+    project = _require_project(project_id, session)
+    client = await _build_client(project)
+    try:
+        repos = await client.list_repos(search=search)
+        return [
+            {
+                "full_name": r.get("full_name", ""),
+                "name": r.get("name", ""),
+                "owner": r.get("owner", {}).get("login", ""),
+                "private": r.get("private", False),
+                "default_branch": r.get("default_branch", "main"),
+                "html_url": r.get("html_url", ""),
+            }
+            for r in repos
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await client.close()
+
+
+@router.get("/{project_id}/remote-workflows")
+async def list_remote_workflows(
+    project_id: str,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """List GitHub Actions workflows for the configured repository."""
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+
+    owner = config.get("owner", "")
+    repo = config.get("repo", "")
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="owner and repo must be configured")
+
+    client = await _build_client(project)
+    try:
+        workflows = await client.list_workflows(owner, repo)
+        return [
+            {
+                "id": w.get("id"),
+                "name": w.get("name", ""),
+                "path": w.get("path", ""),
+                "state": w.get("state", ""),
+            }
+            for w in workflows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await client.close()
+
+
+@router.get("/{project_id}/pull-requests")
+async def list_pull_requests(
+    project_id: str,
+    state: str = "open",
+    limit: int = 30,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """List pull requests from the configured GitHub repository."""
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+
+    owner = config.get("owner", "")
+    repo = config.get("repo", "")
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="owner and repo must be configured")
+
+    normalized_state = state if state in {"open", "closed", "all"} else "open"
+    safe_limit = max(1, min(int(limit or 30), 100))
+    client = await _build_client(project)
+    try:
+        pulls = await client.list_pull_requests(owner, repo, state=normalized_state, limit=safe_limit)
+        return [
+            {
+                "number": pr.get("number"),
+                "title": pr.get("title", ""),
+                "state": pr.get("state", ""),
+                "draft": bool(pr.get("draft", False)),
+                "html_url": pr.get("html_url", ""),
+                "user": (pr.get("user") or {}).get("login"),
+                "base_ref": (pr.get("base") or {}).get("ref"),
+                "head_ref": (pr.get("head") or {}).get("ref"),
+                "head_sha": (pr.get("head") or {}).get("sha"),
+                "updated_at": pr.get("updated_at"),
+                "created_at": pr.get("created_at"),
+            }
+            for pr in pulls
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await client.close()
+
+
+# -- Trigger Workflow ----------------------------------------------
+
+
+@router.post("/{project_id}/trigger-workflow")
+async def trigger_workflow(
+    project_id: str,
+    request: TriggerWorkflowRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Trigger a GitHub Actions workflow_dispatch event."""
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+
+    owner = config.get("owner", "")
+    repo = config.get("repo", "")
+    workflow_id = request.workflow_id or config.get("default_workflow")
+    ref = request.ref or config.get("default_ref", "main")
+
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="owner and repo must be configured")
+    if not workflow_id:
+        raise HTTPException(
+            status_code=400,
+            detail="workflow_id is required (or set default_workflow in config)",
+        )
+
+    client = await _build_client(project)
+    try:
+        await client.trigger_workflow(
+            owner=owner,
+            repo=repo,
+            workflow_id=workflow_id,
+            ref=ref,
+            inputs=request.inputs,
+        )
+
+        # Fetch the latest run for this workflow to get external_pipeline_id
+        # GitHub creates the run asynchronously, so we fetch recent runs
+        runs = await client.get_workflow_runs(owner=owner, repo=repo, workflow_id=workflow_id, per_page=1)
+
+        external_pipeline_id = ""
+        external_url = ""
+        if runs:
+            latest = runs[0]
+            external_pipeline_id = str(latest.get("id", ""))
+            external_url = latest.get("html_url", "")
+
+        # Create tracking record
+        mapping = CiPipelineMapping(
+            project_id=project_id,
+            provider="github",
+            external_pipeline_id=external_pipeline_id or f"pending-{workflow_id}-{ref}",
+            external_project_id=f"{owner}/{repo}",
+            external_url=external_url,
+            ref=ref,
+            triggered_from="dashboard",
+            status="pending",
+        )
+        session.add(mapping)
+        session.commit()
+        session.refresh(mapping)
+
+        return {
+            "status": "triggered",
+            "mapping_id": mapping.id,
+            "workflow_id": workflow_id,
+            "ref": ref,
+            "external_pipeline_id": external_pipeline_id,
+            "external_url": external_url,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to trigger workflow: {e}")
+    finally:
+        await client.close()
+
+
+# -- Pipeline Tracking ---------------------------------------------
+
+
+@router.get("/{project_id}/pipelines")
+def list_pipelines(
+    project_id: str,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """List tracked GitHub pipeline mappings for this project."""
+    _require_project(project_id, session)
+    stmt = (
+        select(CiPipelineMapping)
+        .where(
+            CiPipelineMapping.project_id == project_id,
+            CiPipelineMapping.provider == "github",
+        )
+        .order_by(CiPipelineMapping.created_at.desc())
+    )
+    mappings = session.exec(stmt).all()
+    return [
+        {
+            "id": m.id,
+            "external_pipeline_id": m.external_pipeline_id,
+            "external_project_id": m.external_project_id,
+            "external_url": m.external_url,
+            "ref": m.ref,
+            "status": m.status,
+            "triggered_from": m.triggered_from,
+            "stages": m.stages,
+            "name": m.external_pipeline_id,
+            "total_tests": m.total_tests,
+            "passed_tests": m.passed_tests,
+            "failed_tests": m.failed_tests,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "started_at": m.started_at.isoformat() if m.started_at else None,
+            "completed_at": m.completed_at.isoformat() if m.completed_at else None,
+        }
+        for m in mappings
+    ]
+
+
+@router.post("/{project_id}/sync-runs")
+async def sync_runs(
+    project_id: str,
+    request: SyncRunsRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Sync workflow runs from GitHub into local CiPipelineMapping records.
+
+    Fetches recent runs from GitHub API, creates new mappings for runs not
+    already tracked, and refreshes status of active (pending/running) runs.
+    """
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+
+    owner = config.get("owner", "")
+    repo = config.get("repo", "")
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="owner and repo must be configured")
+
+    client = await _build_client(project)
+    try:
+        runs = await client.get_workflow_runs(
+            owner=owner,
+            repo=repo,
+            workflow_id=request.workflow_id,
+            per_page=request.per_page,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch runs: {e}")
+    finally:
+        await client.close()
+
+    # Load existing external_pipeline_ids for dedup
+    stmt = select(CiPipelineMapping.external_pipeline_id).where(
+        CiPipelineMapping.project_id == project_id,
+        CiPipelineMapping.provider == "github",
+    )
+    existing_ids = set(session.exec(stmt).all())
+
+    # Also load active mappings for status refresh
+    active_stmt = select(CiPipelineMapping).where(
+        CiPipelineMapping.project_id == project_id,
+        CiPipelineMapping.provider == "github",
+        CiPipelineMapping.status.in_(["pending", "running"]),
+    )
+    active_mappings = {m.external_pipeline_id: m for m in session.exec(active_stmt).all()}
+
+    created = 0
+    updated = 0
+
+    for run in runs:
+        run_id_str = str(run.get("id", ""))
+        if not run_id_str:
+            continue
+
+        if run_id_str not in existing_ids:
+            # Parse created_at from GitHub
+            gh_created = run.get("created_at", "")
+            created_dt = datetime.utcnow()
+            if gh_created:
+                try:
+                    created_dt = datetime.fromisoformat(gh_created.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    pass
+
+            mapping = CiPipelineMapping(
+                project_id=project_id,
+                provider="github",
+                external_pipeline_id=run_id_str,
+                external_project_id=f"{owner}/{repo}",
+                external_url=run.get("html_url", ""),
+                ref=run.get("head_branch", ""),
+                triggered_from="sync",
+                status="pending",
+                created_at=created_dt,
+            )
+            _update_mapping_from_run(mapping, run)
+            session.add(mapping)
+            created += 1
+        elif run_id_str in active_mappings:
+            # Refresh status for active pipelines
+            _update_mapping_from_run(active_mappings[run_id_str], run)
+            session.add(active_mappings[run_id_str])
+            updated += 1
+
+    session.commit()
+    logger.info("Synced GitHub runs for project %s: created=%d, updated=%d", project_id, created, updated)
+    return {"status": "ok", "created": created, "updated": updated}
+
+
+@router.get("/{project_id}/pipelines/{pipeline_mapping_id}")
+async def get_pipeline_detail(
+    project_id: str,
+    pipeline_mapping_id: int,
+    refresh: bool = False,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Get pipeline detail with optional refresh from GitHub API."""
+    project = _require_project(project_id, session)
+    mapping = session.get(CiPipelineMapping, pipeline_mapping_id)
+    if not mapping or mapping.project_id != project_id or mapping.provider != "github":
+        raise HTTPException(status_code=404, detail="Pipeline mapping not found")
+
+    # Optionally refresh status from GitHub
+    if refresh and mapping.external_pipeline_id and not mapping.external_pipeline_id.startswith("pending-"):
+        config = _get_github_config(project)
+        if config:
+            owner = config.get("owner", "")
+            repo = config.get("repo", "")
+            if owner and repo:
+                client = await _build_client(project)
+                try:
+                    run_data = await client.get_run(owner, repo, int(mapping.external_pipeline_id))
+                    _update_mapping_from_run(mapping, run_data)
+
+                    # Fetch jobs for stage details
+                    jobs = await client.get_run_jobs(owner, repo, int(mapping.external_pipeline_id))
+                    if jobs:
+                        import json
+
+                        mapping.stages_json = json.dumps(
+                            [
+                                {
+                                    "name": j.get("name", ""),
+                                    "status": j.get("conclusion") or j.get("status", ""),
+                                    "started_at": j.get("started_at"),
+                                    "completed_at": j.get("completed_at"),
+                                }
+                                for j in jobs
+                            ]
+                        )
+
+                    session.add(mapping)
+                    session.commit()
+                    session.refresh(mapping)
+                except Exception as e:
+                    logger.warning("Failed to refresh pipeline %s: %s", mapping.id, e)
+                finally:
+                    await client.close()
+
+    return {
+        "id": mapping.id,
+        "external_pipeline_id": mapping.external_pipeline_id,
+        "external_project_id": mapping.external_project_id,
+        "external_url": mapping.external_url,
+        "ref": mapping.ref,
+        "status": mapping.status,
+        "triggered_from": mapping.triggered_from,
+        "stages": mapping.stages,
+        "total_tests": mapping.total_tests,
+        "passed_tests": mapping.passed_tests,
+        "failed_tests": mapping.failed_tests,
+        "test_report_url": mapping.test_report_url,
+        "created_at": mapping.created_at.isoformat() if mapping.created_at else None,
+        "started_at": mapping.started_at.isoformat() if mapping.started_at else None,
+        "completed_at": mapping.completed_at.isoformat() if mapping.completed_at else None,
+    }
+
+
+# -- Repository Index ----------------------------------------------
+
+
+def _serialize_repo_index(snapshot: RepoIndexSnapshot, derived_impact_maps: int | None = None) -> dict[str, Any]:
+    return {
+        "status": snapshot.status,
+        "snapshot_id": snapshot.id,
+        "owner": snapshot.owner,
+        "repo": snapshot.repo,
+        "ref": snapshot.ref,
+        "commit_sha": snapshot.commit_sha,
+        "file_count": snapshot.indexed_files_count,
+        "source_files_count": snapshot.source_files_count,
+        "test_files_count": snapshot.test_files_count,
+        "route_count": snapshot.route_count,
+        "derived_impact_maps": derived_impact_maps,
+        "summary": snapshot.summary,
+        "created_at": snapshot.created_at.isoformat() if snapshot.created_at else None,
+        "completed_at": snapshot.completed_at.isoformat() if snapshot.completed_at else None,
+    }
+
+
+def _should_index_path(path: str, size: int | None = None) -> bool:
+    if size and size > 250_000:
+        return False
+    lower = path.lower()
+    if lower.startswith(("node_modules/", ".next/", "dist/", "build/", ".git/", "test-results/", "runs/")):
+        return False
+    return lower.endswith((
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".py",
+        ".md",
+        ".json",
+        ".yaml",
+        ".yml",
+    ))
+
+
+async def _build_repository_index(
+    *,
+    project_id: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    client,
+    session: Session,
+    force: bool = False,
+):
+    from orchestrator.services.pr_test_advisor import RepoFileInput, index_repository_snapshot, latest_repo_index
+
+    tree = await client.get_tree(owner, repo, ref, recursive=True)
+    commit_sha = None
+    if tree:
+        commit_sha = next((item.get("sha") for item in tree if item.get("path") == "package.json"), None)
+    existing = latest_repo_index(project_id, owner, repo, ref, session, commit_sha=commit_sha) if not force else None
+    if existing:
+        return existing, None
+
+    selected_files = [
+        item
+        for item in tree
+        if item.get("type") == "blob" and _should_index_path(item.get("path", ""), item.get("size"))
+    ][:800]
+    repo_files = []
+    for item in selected_files:
+        path = item.get("path", "")
+        content = await client.get_file_content(owner, repo, path, ref=ref)
+        if content is None:
+            continue
+        repo_files.append(
+            RepoFileInput(
+                path=path,
+                sha=item.get("sha"),
+                size=item.get("size"),
+                content=content,
+            )
+        )
+    result = index_repository_snapshot(
+        project_id=project_id,
+        owner=owner,
+        repo=repo,
+        ref=ref,
+        commit_sha=commit_sha,
+        files=repo_files,
+        session=session,
+    )
+    return result.snapshot, result.derived_impact_maps
+
+
+@router.post("/{project_id}/repository-index")
+async def create_repository_index(
+    project_id: str,
+    request: RepositoryIndexRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Index the configured GitHub repository so PR Advisor can reason over repo context."""
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+    owner = config.get("owner", "")
+    repo = config.get("repo", "")
+    ref = request.ref or config.get("default_ref") or "main"
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="owner and repo must be configured")
+
+    client = await _build_client(project)
+    try:
+        snapshot, derived = await _build_repository_index(
+            project_id=project_id,
+            owner=owner,
+            repo=repo,
+            ref=ref,
+            client=client,
+            session=session,
+            force=request.force,
+        )
+        return _serialize_repo_index(snapshot, derived_impact_maps=derived)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to index repository: {e}")
+    finally:
+        await client.close()
+
+
+@router.get("/{project_id}/repository-index/latest")
+def get_latest_repository_index(
+    project_id: str,
+    ref: str | None = None,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Return the latest completed repository index for this project."""
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    owner = (config or {}).get("owner", "")
+    repo = (config or {}).get("repo", "")
+    target_ref = ref or (config or {}).get("default_ref") or "main"
+    stmt = (
+        select(RepoIndexSnapshot)
+        .where(
+            RepoIndexSnapshot.project_id == project_id,
+            RepoIndexSnapshot.ref == target_ref,
+            RepoIndexSnapshot.status == "completed",
+        )
+        .order_by(RepoIndexSnapshot.created_at.desc())
+    )
+    if owner:
+        stmt = stmt.where(RepoIndexSnapshot.owner == owner)
+    if repo:
+        stmt = stmt.where(RepoIndexSnapshot.repo == repo)
+    snapshot = session.exec(stmt).first()
+    if not snapshot:
+        return {"status": "missing", "ref": target_ref}
+    return _serialize_repo_index(snapshot)
+
+
+# -- PR Quality Gate -----------------------------------------------
+
+
+async def _analyze_configured_github_pr(
+    *,
+    project_id: str,
+    request: PrQualityGateStartRequest | PrAdvisorAnalyzeRequest,
+    session: Session,
+) -> PrImpactAnalysis:
+    """Analyze a configured GitHub PR and persist a PrImpactAnalysis."""
+    from orchestrator.services.pr_test_advisor import analyze_pr_changes
+
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+
+    owner = config.get("owner", "")
+    repo = config.get("repo", "")
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="owner and repo must be configured")
+
+    client = await _build_client(project)
+    try:
+        pr_data = await client.get_pull_request(owner, repo, request.pr_number)
+        expected_sha = getattr(request, "head_sha", None)
+        actual_sha = (pr_data.get("head") or {}).get("sha")
+        if expected_sha and actual_sha and expected_sha != actual_sha:
+            raise HTTPException(
+                status_code=409,
+                detail="PR head SHA changed before analysis could start; retry for the latest commit.",
+            )
+
+        base_ref = (pr_data.get("base") or {}).get("ref") or config.get("default_ref") or "main"
+        snapshot = None
+        if request.ensure_indexed:
+            snapshot, _derived = await _build_repository_index(
+                project_id=project_id,
+                owner=owner,
+                repo=repo,
+                ref=base_ref,
+                client=client,
+                session=session,
+                force=request.force_reindex,
+            )
+        changed_files = await client.list_pull_request_files(owner, repo, request.pr_number)
+        return analyze_pr_changes(
+            project_id=project_id,
+            owner=owner,
+            repo=repo,
+            pr_number=request.pr_number,
+            pr_data=pr_data,
+            changed_files=changed_files,
+            session=session,
+            snapshot_id=snapshot.id if snapshot else None,
+        )
+    finally:
+        await client.close()
+
+
+def _start_recommended_batch(
+    *,
+    project_id: str,
+    analysis: PrImpactAnalysis,
+    request: PrAdvisorRunRequest | PrQualityGateStartRequest,
+    session: Session,
+) -> dict[str, Any]:
+    """Create and start the regression batch selected by PR analysis."""
+    spec_names = _selected_spec_names_for_analysis(session=session, analysis=analysis, requested=getattr(request, "spec_names", None))
+    if not spec_names:
+        return {"batch_created": False, "reason": "Analysis has no selected tests to run"}
+
+    from orchestrator.services.batch_executor import BatchConfig, create_regression_batch
+
+    config = BatchConfig(
+        project_id=project_id,
+        browser=request.browser,
+        hybrid_mode=request.hybrid,
+        max_iterations=request.max_iterations,
+        automated_only=False,
+        spec_names=spec_names,
+        triggered_by="quality-gate" if isinstance(request, PrQualityGateStartRequest) else "pr-advisor",
+        batch_name=(
+            f"PR #{analysis.pr_number} Quality Gate"
+            if isinstance(request, PrQualityGateStartRequest)
+            else f"PR #{analysis.pr_number} Recommended Tests"
+        ),
+    )
+
+    try:
+        result = create_regression_batch(config, session)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    import asyncio
+
+    from .main import PROCESS_MANAGER, execute_run_task_wrapper
+
+    for task_args in result.tasks_to_start:
+        task = asyncio.ensure_future(
+            execute_run_task_wrapper(
+                spec_path=task_args["spec_path"],
+                run_dir=task_args["run_dir"],
+                run_id=task_args["run_id"],
+                try_code_path=task_args.get("try_code_path"),
+                browser=task_args["browser"],
+                hybrid=task_args["hybrid"],
+                max_iterations=task_args["max_iterations"],
+                batch_id=task_args["batch_id"],
+                spec_name=task_args["spec_name"],
+                project_id=task_args["project_id"],
+            )
+        )
+        if hasattr(PROCESS_MANAGER, "register_task"):
+            PROCESS_MANAGER.register_task(task_args["run_id"], task)
+
+    analysis.batch_id = result.batch_id
+    analysis.updated_at = datetime.utcnow()
+    session.add(analysis)
+    session.commit()
+
+    return {
+        "batch_created": True,
+        "batch_id": result.batch_id,
+        "run_ids": result.run_ids,
+        "count": len(result.run_ids),
+        "spec_names": spec_names,
+    }
+
+
+def _selected_spec_names_for_analysis(
+    *,
+    session: Session,
+    analysis: PrImpactAnalysis,
+    requested: list[str] | None = None,
+) -> list[str]:
+    selected = session.exec(select(PrSelectedTest).where(PrSelectedTest.analysis_id == analysis.id)).all()
+    available = [t.spec_name for t in selected]
+    if not requested:
+        return available
+
+    requested_clean = []
+    for spec in requested:
+        cleaned = str(spec or "").strip()
+        if cleaned and cleaned not in requested_clean:
+            requested_clean.append(cleaned)
+    unknown = sorted(set(requested_clean) - set(available))
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested specs are not part of this PR analysis selection: {', '.join(unknown)}",
+        )
+    return [spec for spec in available if spec in requested_clean]
+
+
+def _batch_payload(batch: RegressionBatch | None, session: Session) -> dict[str, Any] | None:
+    return batch_payload(batch, session)
+
+
+def _quality_gate_status(analysis: PrImpactAnalysis, batch: RegressionBatch | None, session: Session) -> dict[str, Any]:
+    return quality_gate_status(analysis, batch, session)
+
+
+def _app_url(path: str) -> str | None:
+    return quality_gate_app_url(path)
+
+
+def _serialize_quality_gate(analysis: PrImpactAnalysis, session: Session, include_details: bool = True) -> dict[str, Any]:
+    return serialize_quality_gate(analysis, session, include_details=include_details)
+
+
+def _quality_gate_comment(payload: dict[str, Any]) -> str:
+    return quality_gate_comment(payload)
+
+
+async def _publish_quality_gate_feedback(
+    *,
+    project: Project,
+    analysis: PrImpactAnalysis,
+    payload: dict[str, Any],
+    post_feedback: bool,
+    create_commit_status: bool,
+) -> dict[str, Any]:
+    return await publish_quality_gate_feedback(
+        project=project,
+        analysis=analysis,
+        payload=payload,
+        post_feedback=post_feedback,
+        create_commit_status=create_commit_status,
+    )
+
+
+_quality_gate_status = quality_gate_status
+_serialize_quality_gate = serialize_quality_gate
+
+
+@router.post("/{project_id}/quality-gates/pr/start")
+async def start_pr_quality_gate(
+    project_id: str,
+    request: PrQualityGateStartRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Analyze a GitHub PR, optionally run selected tests, and publish quality-gate feedback."""
+    project = _require_project(project_id, session)
+    config = _get_github_config(project)
+    if not config:
+        raise HTTPException(status_code=400, detail="GitHub not configured for this project")
+    owner = config.get("owner", "")
+    repo = config.get("repo", "")
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="owner and repo must be configured")
+
+    defaults = get_quality_gate_config(project)
+    request.ensure_indexed = bool(request.ensure_indexed if request.ensure_indexed is not None else defaults["ensure_indexed"])
+    request.run_recommended = bool(request.run_recommended if request.run_recommended is not None else defaults["run_recommended"])
+    request.post_feedback = bool(request.post_feedback if request.post_feedback is not None else defaults["post_feedback"])
+    request.create_commit_status = bool(
+        request.create_commit_status if request.create_commit_status is not None else defaults["create_commit_status"]
+    )
+    request.browser = request.browser or defaults["default_browser"]
+    request.hybrid = bool(request.hybrid if request.hybrid is not None else defaults["hybrid"])
+    request.max_iterations = int(request.max_iterations or defaults["max_iterations"])
+    request.force_reindex = bool(request.force_reindex if request.force_reindex is not None else defaults["force_reindex"])
+
+    client = await _build_client(project)
+    try:
+        pr_data = await client.get_pull_request(owner, repo, request.pr_number)
+    finally:
+        await client.close()
+    actual_sha = (pr_data.get("head") or {}).get("sha")
+    if not actual_sha:
+        raise HTTPException(status_code=400, detail="PR head SHA could not be resolved")
+    if request.head_sha and request.head_sha != actual_sha:
+        raise HTTPException(
+            status_code=409,
+            detail="PR head SHA changed before analysis could start; retry for the latest commit.",
+        )
+    request.head_sha = actual_sha
+
+    existing_gate = session.exec(
+        select(PrQualityGateRun).where(
+            PrQualityGateRun.project_id == project_id,
+            PrQualityGateRun.provider == "github",
+            PrQualityGateRun.owner == owner,
+            PrQualityGateRun.repo == repo,
+            PrQualityGateRun.pr_number == request.pr_number,
+            PrQualityGateRun.head_sha == actual_sha,
+        )
+    ).first()
+    if existing_gate:
+        analysis = session.get(PrImpactAnalysis, existing_gate.analysis_id) if existing_gate.analysis_id else None
+        if analysis:
+            sync_gate_run_state(existing_gate, analysis, session)
+            session.commit()
+            payload = serialize_quality_gate(analysis, session, include_details=True, gate_run=existing_gate)
+            payload["run_request"] = {"batch_created": False, "reason": "Existing quality gate returned for this PR SHA"}
+            payload["idempotent"] = True
+            return payload
+
+    gate_run = PrQualityGateRun(
+        id=f"qgate_{uuid.uuid4().hex[:12]}",
+        project_id=project_id,
+        provider="github",
+        owner=owner,
+        repo=repo,
+        pr_number=request.pr_number,
+        head_sha=actual_sha,
+        status="initializing",
+        github_state="pending",
+        post_feedback=request.post_feedback,
+        create_commit_status=request.create_commit_status,
+    )
+    session.add(gate_run)
+    try:
+        session.commit()
+        session.refresh(gate_run)
+    except IntegrityError:
+        session.rollback()
+        existing_gate = session.exec(
+            select(PrQualityGateRun).where(
+                PrQualityGateRun.project_id == project_id,
+                PrQualityGateRun.provider == "github",
+                PrQualityGateRun.owner == owner,
+                PrQualityGateRun.repo == repo,
+                PrQualityGateRun.pr_number == request.pr_number,
+                PrQualityGateRun.head_sha == actual_sha,
+            )
+        ).first()
+        if existing_gate and existing_gate.analysis_id:
+            analysis = session.get(PrImpactAnalysis, existing_gate.analysis_id)
+            if analysis:
+                payload = serialize_quality_gate(analysis, session, include_details=True, gate_run=existing_gate)
+                payload["run_request"] = {"batch_created": False, "reason": "Existing quality gate returned for this PR SHA"}
+                payload["idempotent"] = True
+                return payload
+        raise
+
+    gate_run.status = "analyzing"
+    gate_run.updated_at = datetime.utcnow()
+    session.add(gate_run)
+    session.commit()
+
+    analysis = await _analyze_configured_github_pr(project_id=project_id, request=request, session=session)
+    gate_run.analysis_id = analysis.id
+    gate_run.updated_at = datetime.utcnow()
+    session.add(gate_run)
+    session.commit()
+
+    run_result = None
+    if request.run_recommended:
+        run_result = _start_recommended_batch(project_id=project_id, analysis=analysis, request=request, session=session)
+        session.refresh(analysis)
+        gate_run.batch_id = analysis.batch_id
+        gate_run.status = "queued" if analysis.batch_id else "blocked"
+        gate_run.updated_at = datetime.utcnow()
+        session.add(gate_run)
+        session.commit()
+
+    sync_gate_run_state(gate_run, analysis, session)
+    session.commit()
+    payload = serialize_quality_gate(analysis, session, include_details=True, gate_run=gate_run)
+    payload["run_request"] = run_result
+    if request.post_feedback or request.create_commit_status:
+        payload["feedback"] = await publish_quality_gate_feedback(
+            project=project,
+            analysis=analysis,
+            payload=payload,
+            gate_run=gate_run,
+            post_feedback=request.post_feedback,
+            create_commit_status=request.create_commit_status,
+        )
+        session.add(gate_run)
+        session.commit()
+    return payload
+
+
+@router.get("/{project_id}/quality-gates/pr/status")
+def get_pr_quality_gate_status_for_ci(
+    project_id: str,
+    pr_number: int,
+    head_sha: str,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Return CI-friendly quality-gate status for a PR head SHA."""
+    _require_project(project_id, session)
+    gate_run = session.exec(
+        select(PrQualityGateRun).where(
+            PrQualityGateRun.project_id == project_id,
+            PrQualityGateRun.provider == "github",
+            PrQualityGateRun.pr_number == pr_number,
+            PrQualityGateRun.head_sha == head_sha,
+        )
+    ).first()
+    if not gate_run or not gate_run.analysis_id:
+        raise HTTPException(status_code=404, detail="PR quality gate not found")
+    analysis = session.get(PrImpactAnalysis, gate_run.analysis_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="PR quality gate analysis not found")
+    sync_gate_run_state(gate_run, analysis, session)
+    session.commit()
+    return ci_status_payload(analysis, session, gate_run=gate_run)
+
+
+@router.get("/{project_id}/quality-gates/pr/{analysis_id}")
+async def get_pr_quality_gate(
+    project_id: str,
+    analysis_id: str,
+    refresh_feedback: bool = False,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Return the current quality-gate state for a stored PR impact analysis."""
+    project = _require_project(project_id, session)
+    analysis = session.get(PrImpactAnalysis, analysis_id)
+    if not analysis or analysis.project_id != project_id:
+        raise HTTPException(status_code=404, detail="PR quality gate not found")
+    gate_run = session.exec(select(PrQualityGateRun).where(PrQualityGateRun.analysis_id == analysis.id)).first()
+    if gate_run:
+        sync_gate_run_state(gate_run, analysis, session)
+        session.commit()
+    payload = serialize_quality_gate(analysis, session, include_details=True, gate_run=gate_run)
+    if refresh_feedback:
+        payload["feedback"] = await publish_quality_gate_feedback(
+            project=project,
+            analysis=analysis,
+            payload=payload,
+            gate_run=gate_run,
+            post_feedback=gate_run.post_feedback if gate_run else True,
+            create_commit_status=gate_run.create_commit_status if gate_run else True,
+        )
+        if gate_run:
+            session.add(gate_run)
+            session.commit()
+    return payload
+
+
+@router.get("/{project_id}/quality-gates/pr")
+def list_pr_quality_gates(
+    project_id: str,
+    limit: int = 20,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """List recent PR quality gates with current gate status."""
+    _require_project(project_id, session)
+    safe_limit = max(1, min(limit, 100))
+    gate_runs = session.exec(
+        select(PrQualityGateRun)
+        .where(PrQualityGateRun.project_id == project_id)
+        .order_by(PrQualityGateRun.created_at.desc())
+        .limit(safe_limit)
+    ).all()
+    payloads = []
+    for gate_run in gate_runs:
+        analysis = session.get(PrImpactAnalysis, gate_run.analysis_id) if gate_run.analysis_id else None
+        if not analysis:
+            continue
+        sync_gate_run_state(gate_run, analysis, session)
+        payloads.append(serialize_quality_gate(analysis, session, include_details=False, gate_run=gate_run))
+    session.commit()
+    return payloads
+
+
+# -- PR Test Advisor -----------------------------------------------
+
+
+@router.post("/{project_id}/pr-advisor/analyze")
+async def analyze_pull_request_tests(
+    project_id: str,
+    request: PrAdvisorAnalyzeRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Analyze a GitHub PR and recommend impacted Quorvex tests."""
+    from orchestrator.services.pr_test_advisor import serialize_analysis
+
+    try:
+        analysis = await _analyze_configured_github_pr(project_id=project_id, request=request, session=session)
+        return serialize_analysis(analysis, session, include_details=True)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to analyze PR: {e}")
+
+
+@router.get("/{project_id}/pr-advisor/analyses")
+def list_pr_advisor_analyses(
+    project_id: str,
+    limit: int = 20,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """List recent PR impact analyses for a project."""
+    from orchestrator.services.pr_test_advisor import serialize_analysis
+
+    _require_project(project_id, session)
+    safe_limit = max(1, min(limit, 100))
+    analyses = session.exec(
+        select(PrImpactAnalysis)
+        .where(PrImpactAnalysis.project_id == project_id)
+        .order_by(PrImpactAnalysis.created_at.desc())
+        .limit(safe_limit)
+    ).all()
+    return [serialize_analysis(a, session, include_details=False) for a in analyses]
+
+
+@router.get("/{project_id}/pr-advisor/analyses/{analysis_id}")
+def get_pr_advisor_analysis(
+    project_id: str,
+    analysis_id: str,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Get a stored PR impact analysis with changed files and selected tests."""
+    from orchestrator.services.pr_test_advisor import serialize_analysis
+
+    _require_project(project_id, session)
+    analysis = session.get(PrImpactAnalysis, analysis_id)
+    if not analysis or analysis.project_id != project_id:
+        raise HTTPException(status_code=404, detail="PR impact analysis not found")
+    return serialize_analysis(analysis, session, include_details=True)
+
+
+@router.post("/{project_id}/pr-advisor/analyses/{analysis_id}/run")
+async def run_pr_advisor_recommendation(
+    project_id: str,
+    analysis_id: str,
+    request: PrAdvisorRunRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Run the tests selected by a PR impact analysis as a regression batch."""
+    _require_project(project_id, session)
+    analysis = session.get(PrImpactAnalysis, analysis_id)
+    if not analysis or analysis.project_id != project_id:
+        raise HTTPException(status_code=404, detail="PR impact analysis not found")
+
+    result = _start_recommended_batch(project_id=project_id, analysis=analysis, request=request, session=session)
+    if not result.get("batch_created"):
+        raise HTTPException(status_code=400, detail=result.get("reason") or "Analysis has no selected tests to run")
+
+    return {
+        "batch_id": result["batch_id"],
+        "run_ids": result["run_ids"],
+        "count": result["count"],
+        "spec_names": result.get("spec_names", []),
+        "analysis_id": analysis_id,
+    }
+
+
+# -- Webhook -------------------------------------------------------
+
+
+def _update_mapping_from_run(mapping: CiPipelineMapping, run_data: dict[str, Any]):
+    """Update a CiPipelineMapping from a GitHub workflow_run payload."""
+    # Map GitHub status/conclusion to our status
+    gh_status = run_data.get("status", "")
+    gh_conclusion = run_data.get("conclusion")
+
+    if gh_status == "completed":
+        if gh_conclusion == "success":
+            mapping.status = "success"
+        elif gh_conclusion == "failure":
+            mapping.status = "failed"
+        elif gh_conclusion == "cancelled":
+            mapping.status = "cancelled"
+        else:
+            mapping.status = gh_conclusion or "failed"
+    elif gh_status == "in_progress":
+        mapping.status = "running"
+    elif gh_status == "queued":
+        mapping.status = "pending"
+
+    mapping.external_url = run_data.get("html_url", mapping.external_url)
+
+    # Parse timestamps
+    run_started = run_data.get("run_started_at")
+    if run_started:
+        try:
+            mapping.started_at = datetime.fromisoformat(run_started.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            pass
+
+    updated_at = run_data.get("updated_at")
+    if gh_status == "completed" and updated_at:
+        try:
+            mapping.completed_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            pass
+
+
+async def _process_webhook(
+    payload: dict[str, Any],
+    project_id: str | None = None,
+):
+    """Background task to process a GitHub webhook event."""
+    try:
+        payload.get("action", "")
+        workflow_run = payload.get("workflow_run", {})
+        run_id = str(workflow_run.get("id", ""))
+        repository = payload.get("repository", {}) or {}
+        repo_full_name = repository.get("full_name")
+
+        if not run_id:
+            logger.debug("Webhook payload missing workflow_run.id, skipping")
+            return
+
+        from sqlmodel import Session as _Session
+
+        from .db import engine
+
+        with _Session(engine) as session:
+            # Find matching pipeline mapping
+            stmt = select(CiPipelineMapping).where(
+                CiPipelineMapping.provider == "github",
+                CiPipelineMapping.external_pipeline_id == run_id,
+            )
+            if project_id:
+                stmt = stmt.where(CiPipelineMapping.project_id == project_id)
+            elif repo_full_name:
+                stmt = stmt.where(CiPipelineMapping.external_project_id == repo_full_name)
+            mapping = session.exec(stmt).first()
+
+            if not mapping:
+                logger.debug("No pipeline mapping found for GitHub run %s, skipping", run_id)
+                return
+
+            _update_mapping_from_run(mapping, workflow_run)
+            session.add(mapping)
+            session.commit()
+
+            logger.info(
+                "Updated pipeline mapping %s from webhook: status=%s",
+                mapping.id,
+                mapping.status,
+            )
+
+    except Exception as e:
+        logger.error("Error processing GitHub webhook: %s", e)
+
+
+@router.post("/webhook/github")
+async def handle_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """Receive GitHub webhook events.
+
+    Validates X-Hub-Signature-256 using HMAC-SHA256 if a webhook secret
+    is configured. Handles workflow_run events to update pipeline status.
+    """
+    body = await request.body()
+    event_type = request.headers.get("X-GitHub-Event", "")
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    validated_project_id: str | None = None
+
+    # Try to validate signature if any project has a webhook secret configured
+    # We validate signature per-project since different projects may have different secrets
+    from sqlmodel import Session as _Session
+
+    from ..services.github_client import verify_webhook_signature
+    from .db import engine
+
+    with _Session(engine) as session:
+        projects_with_secret = []
+        for project in session.exec(select(Project)).all():
+            config = _get_github_config(project)
+            if config and config.get("webhook_secret_encrypted"):
+                projects_with_secret.append((project, config))
+
+        if projects_with_secret and not signature:
+            raise HTTPException(status_code=401, detail="Missing webhook signature")
+
+        validated = not projects_with_secret
+        for project, config in projects_with_secret:
+            secret = decrypt_credential(config.get("webhook_secret_encrypted", ""))
+            if secret and verify_webhook_signature(body, signature, secret):
+                validated = True
+                validated_project_id = project.id
+                break
+        if not validated:
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    # Only process workflow_run events
+    if event_type != "workflow_run":
+        return {"status": "ignored", "event": event_type}
+
+    try:
+        import json
+
+        payload = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    background_tasks.add_task(_process_webhook, payload, validated_project_id)
+    return {"status": "ok"}

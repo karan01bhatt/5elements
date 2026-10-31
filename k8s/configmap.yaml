@@ -1,0 +1,38 @@
+# ConfigMap for non-sensitive configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quorvex-config
+  namespace: quorvex
+  labels:
+    app.kubernetes.io/name: quorvex-config
+data:
+  # API URL for frontend
+  api-url: "http://backend:8001"
+
+  # Z.ai GLM Coding Plan configuration (Anthropic-compatible)
+  anthropic-base-url: "https://api.z.ai/api/anthropic"
+  anthropic-model: "glm-5.1"
+  anthropic-opus-model: "glm-5.1"
+  anthropic-sonnet-model: "glm-5-turbo"
+  anthropic-haiku-model: "glm-4.5-air"
+  anthropic-chat-model: "glm-5-turbo"
+  api-timeout-ms: "3000000"
+
+  # Database configuration
+  postgres-db: "playwright_agent"
+
+  # Worker configuration
+  playwright-workers: "4"
+  default-parallelism: "4"
+  browser-worker-replicas: "4"
+
+  # Resource limits
+  max-concurrent-agents: "8"
+  max-concurrent-explorations: "5"
+  max-concurrent-prd: "3"
+
+  # Timeouts (minutes)
+  agent-timeout-minutes: "60"
+  exploration-timeout-minutes: "30"
+  prd-timeout-minutes: "10"

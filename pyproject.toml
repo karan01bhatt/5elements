@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quorvex-ai"
+version = "1.2.14"
+description = "Self-hosted AI testing agents that turn specs into validated Playwright tests"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Nihad Mammadli"}]
+keywords = ["playwright", "test-automation", "ai", "self-healing", "natural-language", "testing", "llm", "fastapi", "load-testing", "security-testing"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "claude-agent-sdk==0.2.101",
+    "jsonschema==4.26.0",
+    "PyYAML==6.0.3",
+    "python-dotenv==1.2.1",
+    "black==25.12.0",
+    "pytest==9.0.2",
+    "pytest-asyncio==1.3.0",
+    "pytest-cov>=7.0.0",
+    "fastapi==0.128.0",
+    "uvicorn==0.40.0",
+    "sqlmodel==0.0.31",
+    "psycopg2-binary==2.9.11",
+    "alembic==1.18.3",
+    "minio>=7.2.0",
+    "networkx>=3.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=4.0.0,<5.0.0",
+    "redis>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/NihadMemmedli/quorvex_ai"
+Repository = "https://github.com/NihadMemmedli/quorvex_ai"
+Documentation = "https://nihadmemmedli.github.io/quorvex_ai/"
+Changelog = "https://github.com/NihadMemmedli/quorvex_ai/blob/main/CHANGELOG.md"
+
+[project.scripts]
+quorvex = "orchestrator.cli:main"
+playwright-agent = "orchestrator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["orchestrator*"]

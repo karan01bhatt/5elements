@@ -1,0 +1,43 @@
+'use client';
+import React from 'react';
+import { Loader2, CheckCircle, AlertCircle, AlertTriangle, Clock, XCircle } from 'lucide-react';
+import { statusColor } from '@/lib/colors';
+
+interface StatusBadgeProps {
+    status: string;
+}
+
+const STATUS_ICONS: Record<string, React.ReactNode> = {
+    running: <Loader2 size={12} className="animate-spin" />,
+    pending: <Clock size={12} />,
+    completed: <CheckCircle size={12} />,
+    passed: <CheckCircle size={12} />,
+    failed: <AlertCircle size={12} />,
+    error: <AlertTriangle size={12} />,
+    cancelled: <XCircle size={12} />,
+};
+
+function statusLabel(status?: string) {
+    return (status || 'unknown')
+        .replace(/_/g, ' ')
+        .toLowerCase()
+        .replace(/\b\w/g, letter => letter.toUpperCase());
+}
+
+export const StatusBadge = React.memo(function StatusBadge({ status }: StatusBadgeProps) {
+    const normalizedStatus = status || 'unknown';
+    const color = statusColor(normalizedStatus);
+    const icon = STATUS_ICONS[normalizedStatus.toLowerCase()];
+
+    return (
+        <span style={{
+            display: 'inline-flex', alignItems: 'center', gap: '4px',
+            padding: '2px 9px', borderRadius: '9999px', fontSize: '0.75rem', fontWeight: 650,
+            color, background: `${color}18`,
+            transition: 'all 0.2s var(--ease-smooth)',
+        }}>
+            {icon}
+            {statusLabel(status)}
+        </span>
+    );
+});

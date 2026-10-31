@@ -1,0 +1,69 @@
+{
+  "name": "quorvex-ai",
+  "version": "1.2.14",
+  "description": "Quorvex AI — Intelligent test automation platform that converts natural language specifications into production-ready Playwright tests.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "npx playwright test",
+    "test:e2e:dashboard-critical": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=${PLAYWRIGHT_WORKERS:-2} npx playwright test tests/e2e/dashboard-route-smoke.spec.ts tests/e2e/dashboard-feature-controls.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium}'",
+    "test:e2e:workflow-base-url": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/workflow-creation.spec.ts tests/e2e/project-base-url-defaults.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:browser-auth-sessions": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/browser-auth-sessions.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:autopilot-checklist": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/autopilot-checklist.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:stable-openapi": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/openapi-import.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:memory": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/memory.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:stable-coverage": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/coverage-intelligence.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:stable-pr-advisor": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/pr-advisor.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:stable-agents": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/agents.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:stable-test-data": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/test-data.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:stable-custom-workflow": "sh -c 'PLAYWRIGHT_START_WEB_SERVER=true BASE_URL=${BASE_URL:-http://localhost:3000} API_BASE=${API_BASE:-http://localhost:8001} PLAYWRIGHT_WORKERS=1 npx playwright test tests/e2e/custom-workflow-execution.spec.ts --project=${PLAYWRIGHT_PROJECT:-chromium} --workers=1'",
+    "test:e2e:stable-mocked": "npm run test:e2e:stable-openapi && npm run test:e2e:memory && npm run test:e2e:stable-coverage && npm run test:e2e:stable-pr-advisor && npm run test:e2e:stable-agents && npm run test:e2e:stable-test-data && npm run test:e2e:stable-custom-workflow"
+  },
+  "keywords": [
+    "playwright",
+    "automation",
+    "testing",
+    "ai",
+    "agent",
+    "claude",
+    "nlp",
+    "test-generation",
+    "self-healing",
+    "typescript",
+    "llm",
+    "nextjs",
+    "fastapi",
+    "load-testing",
+    "security-testing"
+  ],
+  "author": "Nihad Mammadli",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "1.61.0",
+    "@types/node": "^25.6.0",
+    "appium": "3.5.0",
+    "appium-mcp": "1.85.6",
+    "appium-xcuitest-driver": "^11.4.0",
+    "dotenv": "^17.3.1",
+    "webdriverio": "^9.27.1"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.177",
+    "@playwright/mcp": "0.0.76",
+    "playwright": "1.61.0",
+    "playwright-core": "1.61.0",
+    "undici-types": "^7.16.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NihadMemmedli/quorvex_ai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NihadMemmedli/quorvex_ai/issues"
+  },
+  "homepage": "https://nihadmemmedli.github.io/quorvex_ai/"
+}

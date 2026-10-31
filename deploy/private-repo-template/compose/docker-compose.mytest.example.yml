@@ -1,0 +1,188 @@
+# Private production overlay for mytest.idda.az.
+#
+# Copy to compose/docker-compose.mytest.yml in the private deploy repo. Keep
+# host paths, domains, and server-specific ports private.
+
+services:
+  backend:
+    image: ${QUORVEX_BACKEND_IMAGE:?Set QUORVEX_BACKEND_IMAGE}
+    build: !reset null
+    pull_policy: always
+    ports: !override
+      - "${BACKEND_BIND:-127.0.0.1:8001}:8001"
+      - "${VNC_BIND:-127.0.0.1:6080}:6080"
+    environment:
+      HOME: /home/agent
+      USER: agent
+      REQUIRE_AUTH: "true"
+      ALLOW_REGISTRATION: "false"
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS}
+      VNC_PUBLIC_WS_URL: ${VNC_PUBLIC_WS_URL:?Set VNC_PUBLIC_WS_URL}
+      RECORDER_BROWSER_URL: ${RECORDER_BROWSER_URL:-}
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+      - ${QUORVEX_DATA_ROOT:-./data}/logs:/app/logs
+      - ${QUORVEX_DATA_ROOT:-./data}/app-data:/app/data
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs
+      - ${PRDS_DIR:?Set PRDS_DIR}:/app/prds
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests
+      - ${QUORVEX_DATA_ROOT:-./data}/generated-scripts:/app/scripts
+
+  backend-slim:
+    image: ${QUORVEX_BACKEND_SLIM_IMAGE:?Set QUORVEX_BACKEND_SLIM_IMAGE}
+    build: !reset null
+    pull_policy: always
+    ports: !override
+      - "${BACKEND_BIND:-127.0.0.1:8001}:8001"
+    environment:
+      REQUIRE_AUTH: "true"
+      ALLOW_REGISTRATION: "false"
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS}
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+      - ${QUORVEX_DATA_ROOT:-./data}/logs:/app/logs
+      - ${QUORVEX_DATA_ROOT:-./data}/app-data:/app/data
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs
+      - ${PRDS_DIR:?Set PRDS_DIR}:/app/prds
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests
+
+  agent-worker:
+    image: ${QUORVEX_BACKEND_SLIM_IMAGE:?Set QUORVEX_BACKEND_SLIM_IMAGE}
+    build: !reset null
+    pull_policy: always
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+      - ${QUORVEX_DATA_ROOT:-./data}/logs:/app/logs
+      - ${QUORVEX_DATA_ROOT:-./data}/app-data:/app/data
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs
+      - ${PRDS_DIR:?Set PRDS_DIR}:/app/prds
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests
+
+  autonomous-mission-worker:
+    image: ${QUORVEX_BACKEND_SLIM_IMAGE:?Set QUORVEX_BACKEND_SLIM_IMAGE}
+    build: !reset null
+    pull_policy: always
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+      - ${QUORVEX_DATA_ROOT:-./data}/logs:/app/logs
+      - ${QUORVEX_DATA_ROOT:-./data}/app-data:/app/data
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs
+      - ${PRDS_DIR:?Set PRDS_DIR}:/app/prds
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests
+
+  custom-workflow-worker:
+    image: ${QUORVEX_BACKEND_SLIM_IMAGE:?Set QUORVEX_BACKEND_SLIM_IMAGE}
+    build: !reset null
+    pull_policy: always
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+      - ${QUORVEX_DATA_ROOT:-./data}/logs:/app/logs
+      - ${QUORVEX_DATA_ROOT:-./data}/app-data:/app/data
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs
+      - ${PRDS_DIR:?Set PRDS_DIR}:/app/prds
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests
+
+  backup-scheduler:
+    image: ${QUORVEX_BACKEND_SLIM_IMAGE:?Set QUORVEX_BACKEND_SLIM_IMAGE}
+    build: !reset null
+    pull_policy: always
+    volumes:
+      - ${QUORVEX_SOURCE_DIR:?Set QUORVEX_SOURCE_DIR}/scripts/full_backup.sh:/scripts/full_backup.sh:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/backups:/backups
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs:ro
+      - ${PRDS_DIR:?Set PRDS_DIR}:/app/prds:ro
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/app-data:/app/data:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/generated-scripts:/app/scripts:ro
+
+  backup-full:
+    volumes:
+      - ${QUORVEX_SOURCE_DIR:?Set QUORVEX_SOURCE_DIR}/scripts/full_backup.sh:/scripts/full_backup.sh:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/backups:/backups
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs:ro
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests:ro
+      - ${PRDS_DIR:?Set PRDS_DIR}:/app/prds:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/app-data:/app/data:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/generated-scripts:/app/scripts:ro
+
+  restore:
+    volumes:
+      - ${QUORVEX_SOURCE_DIR:?Set QUORVEX_SOURCE_DIR}/scripts/restore.sh:/scripts/restore.sh:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/backups:/backups
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests
+      - ${PRDS_DIR:?Set PRDS_DIR}:/app/prds
+      - ${QUORVEX_DATA_ROOT:-./data}/app-data:/app/data
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results
+      - ${QUORVEX_DATA_ROOT:-./data}/generated-scripts:/app/scripts
+
+  archival:
+    image: ${QUORVEX_BACKEND_SLIM_IMAGE:?Set QUORVEX_BACKEND_SLIM_IMAGE}
+    build: !reset null
+    pull_policy: always
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+
+  frontend:
+    image: ${QUORVEX_FRONTEND_IMAGE:?Set QUORVEX_FRONTEND_IMAGE}
+    build: !reset null
+    pull_policy: always
+    ports: !override
+      - "${FRONTEND_BIND:-127.0.0.1:3000}:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${QUORVEX_PUBLIC_API_URL:-}
+      INTERNAL_API_URL: http://backend:8001
+
+  browser-workers:
+    image: ${QUORVEX_BROWSER_WORKER_IMAGE:?Set QUORVEX_BROWSER_WORKER_IMAGE}
+    build: !reset null
+    pull_policy: always
+    volumes:
+      - ${TESTS_DIR:?Set TESTS_DIR}:/app/tests:ro
+      - ${SPECS_DIR:?Set SPECS_DIR}:/app/specs:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/test-results:/app/test-results
+
+  k6-workers:
+    image: ${QUORVEX_K6_WORKER_IMAGE:?Set QUORVEX_K6_WORKER_IMAGE}
+    build: !reset null
+    pull_policy: always
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/generated-scripts:/app/scripts:ro
+      - ${QUORVEX_DATA_ROOT:-./data}/runs:/app/runs
+
+  db:
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/postgres:/var/lib/postgresql/data
+
+  redis:
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/redis:/data
+
+  minio:
+    ports: !override
+      - "${MINIO_API_BIND:-127.0.0.1:9000}:9000"
+      - "${MINIO_CONSOLE_BIND:-127.0.0.1:9001}:9001"
+    volumes:
+      - ${QUORVEX_DATA_ROOT:-./data}/minio:/data
+
+  temporal:
+    ports: !override
+      - "${TEMPORAL_BIND:-127.0.0.1:7233}:7233"
+
+  temporal-ui:
+    ports: !override
+      - "${TEMPORAL_UI_BIND:-127.0.0.1:8233}:8080"
+
+  zap:
+    ports: !override
+      - "${ZAP_BIND:-127.0.0.1:8090}:8090"

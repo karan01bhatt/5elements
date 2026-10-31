@@ -1,0 +1,52 @@
+name: Docker CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Docker build and optional AI smoke
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build Docker image
+        run: docker build -t quorvex-ai .
+
+      - name: Optional smoke test with AI credentials
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ secrets.ANTHROPIC_DEFAULT_SONNET_MODEL }}
+        run: |
+          if [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+            echo "ANTHROPIC_AUTH_TOKEN is not configured; skipping optional Docker AI smoke test."
+            exit 0
+          fi
+
+          export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+          export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-4-20250514}"
+
+          mkdir -p runs
+          docker run --rm \
+            -e ANTHROPIC_AUTH_TOKEN \
+            -e ANTHROPIC_BASE_URL \
+            -e ANTHROPIC_DEFAULT_SONNET_MODEL \
+            -v ${{ github.workspace }}/runs:/app/runs \
+            quorvex-ai specs/smoke_healing_1.md
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: runs/
+          retention-days: 7

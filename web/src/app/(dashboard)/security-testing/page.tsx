@@ -1,0 +1,414 @@
+'use client';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { ShieldAlert, Play, FileCode, Clock, Bug } from 'lucide-react';
+import { PageLayout } from '@/components/ui/page-layout';
+import { PageHeader } from '@/components/ui/page-header';
+import { useRequiredProject } from '@/contexts/ProjectContext';
+import { useProjectRole } from '@/hooks/useProjectRole';
+import { API_BASE, withProjectBody, withProjectQuery } from '@/lib/api';
+import { applyProjectDefaultUrl, getProjectDefaultUrl, trimUrlInput } from '@/lib/project-url';
+import { createTabStyle, getAuthHeaders, cardStyle } from '@/lib/styles';
+import { severityColor } from '@/lib/colors';
+import {
+    CredentialOption,
+    SecurityCapabilities,
+    SecuritySpec,
+    SecurityScanRun,
+    SecurityTarget,
+    JobStatus,
+    FindingSummary,
+    TabType,
+} from './components/types';
+import ScannerTab from './components/ScannerTab';
+import SpecsTab from './components/SpecsTab';
+import HistoryTab from './components/HistoryTab';
+import FindingsTab from './components/FindingsTab';
+
+export default function SecurityTestingPage() {
+    const { currentProject, projectId } = useRequiredProject();
+    const { canEdit } = useProjectRole(projectId);
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const projectDefaultUrl = getProjectDefaultUrl(currentProject);
+    const previousProjectDefaultUrlRef = useRef('');
+
+    const initialTab = (searchParams.get('tab') || 'scanner') as TabType;
+    const normalizedInitialTab = (
+        ['scanner', 'specs', 'history', 'findings'].includes(initialTab) ? initialTab : 'scanner'
+    ) as TabType;
+    const [activeTab, setActiveTab] = useState<TabType>(normalizedInitialTab);
+    const [visitedTabs, setVisitedTabs] = useState<Set<TabType>>(new Set(['scanner', normalizedInitialTab]));
+
+    // Scanner state
+    const [scanUrl, setScanUrl] = useState('');
+    const [scanType, setScanType] = useState('quick');
+    const [activeScanLevel, setActiveScanLevel] = useState('safe');
+    const [authEnabled, setAuthEnabled] = useState(false);
+    const [loginUrl, setLoginUrl] = useState('');
+    const [usernameKey, setUsernameKey] = useState('');
+    const [passwordKey, setPasswordKey] = useState('');
+    const [excludedPaths, setExcludedPaths] = useState('');
+    const [isScanning, setIsScanning] = useState(false);
+    const [activeJobId, setActiveJobId] = useState<string | null>(null);
+    const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
+    const [capabilities, setCapabilities] = useState<SecurityCapabilities | null>(null);
+    const [targets, setTargets] = useState<SecurityTarget[]>([]);
+    const [credentials, setCredentials] = useState<CredentialOption[]>([]);
+
+    // Specs state
+    const [specs, setSpecs] = useState<SecuritySpec[]>([]);
+
+    // History state
+    const [runs, setRuns] = useState<SecurityScanRun[]>([]);
+
+    // Findings state
+    const [findingSummary, setFindingSummary] = useState<FindingSummary | null>(null);
+
+    // Polling
+    const pollRef = useRef<NodeJS.Timeout | null>(null);
+
+    useEffect(() => {
+        setScanUrl(prev => applyProjectDefaultUrl(prev, projectDefaultUrl, previousProjectDefaultUrlRef.current));
+        previousProjectDefaultUrlRef.current = projectDefaultUrl;
+    }, [projectDefaultUrl]);
+
+    const updateUrlState = useCallback((updates: Record<string, string | null>) => {
+        const next = new URLSearchParams(searchParams.toString());
+        Object.entries(updates).forEach(([key, value]) => {
+            if (value) next.set(key, value);
+            else next.delete(key);
+        });
+        const query = next.toString();
+        router.replace(query ? `/security-testing?${query}` : '/security-testing', { scroll: false });
+    }, [router, searchParams]);
+
+    const handleTabChange = useCallback((tab: TabType) => {
+        setActiveTab(tab);
+        updateUrlState({ tab });
+    }, [updateUrlState]);
+
+    useEffect(() => {
+        const tab = searchParams.get('tab') as TabType | null;
+        if (tab && ['scanner', 'specs', 'history', 'findings'].includes(tab) && tab !== activeTab) {
+            setActiveTab(tab);
+        }
+    }, [activeTab, searchParams]);
+
+    // ========== Data Fetching ==========
+
+    const fetchSpecs = useCallback(async () => {
+        try {
+            const res = await fetch(`${API_BASE}${withProjectQuery('/security-testing/specs', projectId)}`, { headers: getAuthHeaders() });
+            if (res.ok) setSpecs(await res.json());
+        } catch (e) { console.error('Failed to fetch specs:', e); }
+    }, [projectId]);
+
+    const fetchRuns = useCallback(async () => {
+        try {
+            const res = await fetch(`${API_BASE}${withProjectQuery('/security-testing/runs?limit=50', projectId)}`, { headers: getAuthHeaders() });
+            if (res.ok) { const data = await res.json(); setRuns(data.runs || []); }
+        } catch (e) { console.error('Failed to fetch runs:', e); }
+    }, [projectId]);
+
+    const fetchFindingSummary = useCallback(async () => {
+        try {
+            const res = await fetch(`${API_BASE}${withProjectQuery('/security-testing/findings/summary', projectId)}`, { headers: getAuthHeaders() });
+            if (res.ok) {
+                const data = await res.json();
+                const bySev = data.by_severity || {};
+                setFindingSummary({
+                    total: data.total_open || 0,
+                    critical: bySev.critical || 0, high: bySev.high || 0,
+                    medium: bySev.medium || 0, low: bySev.low || 0, info: bySev.info || 0,
+                    open: data.by_status?.open || data.total_open || 0,
+                    false_positive: data.by_status?.false_positive || 0,
+                    fixed: data.by_status?.fixed || 0,
+                    accepted_risk: data.by_status?.accepted_risk || 0,
+                });
+            }
+        } catch (e) { console.error('Failed to fetch summary:', e); }
+    }, [projectId]);
+
+    const fetchCapabilities = useCallback(async () => {
+        try {
+            const res = await fetch(`${API_BASE}/security-testing/capabilities`, { headers: getAuthHeaders() });
+            if (res.ok) setCapabilities(await res.json());
+        } catch (e) { console.error('Failed to fetch security capabilities:', e); }
+    }, []);
+
+    const fetchTargets = useCallback(async () => {
+        try {
+            const res = await fetch(`${API_BASE}${withProjectQuery('/security-testing/targets', projectId)}`, { headers: getAuthHeaders() });
+            if (res.ok) {
+                const data = await res.json();
+                setTargets(data.targets || []);
+            }
+        } catch (e) { console.error('Failed to fetch security targets:', e); }
+    }, [projectId]);
+
+    const fetchCredentials = useCallback(async () => {
+        try {
+            const res = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/credentials?include_env=true`, { headers: getAuthHeaders() });
+            if (res.ok) {
+                const data = await res.json();
+                setCredentials(data.credentials || []);
+            }
+        } catch (e) { console.error('Failed to fetch credentials:', e); }
+    }, [projectId]);
+
+    // Refresh on tab change or project change
+    useEffect(() => {
+        if (activeTab === 'specs') fetchSpecs();
+        if (activeTab === 'history') fetchRuns();
+        if (activeTab === 'findings') { fetchFindingSummary(); fetchRuns(); }
+    }, [activeTab, projectId, fetchSpecs, fetchRuns, fetchFindingSummary]);
+
+    useEffect(() => {
+        fetchCapabilities();
+        fetchTargets();
+        fetchCredentials();
+        fetchFindingSummary();
+    }, [fetchCapabilities, fetchTargets, fetchCredentials, fetchFindingSummary]);
+
+    useEffect(() => {
+        const jobId = searchParams.get('jobId');
+        if (!jobId || activeJobId === jobId) return;
+        setActiveJobId(jobId);
+        setIsScanning(true);
+    }, [activeJobId, searchParams]);
+
+    useEffect(() => {
+        function handleSecurityRefresh(event: Event) {
+            const detail = (event as CustomEvent).detail || {};
+            if (detail.projectId && detail.projectId !== projectId) return;
+            fetchSpecs();
+            fetchRuns();
+            fetchFindingSummary();
+            if (detail.specName) handleTabChange('specs');
+            else if (detail.findingId || detail.runId) handleTabChange('findings');
+        }
+        window.addEventListener('quorvex:security-refresh', handleSecurityRefresh);
+        return () => window.removeEventListener('quorvex:security-refresh', handleSecurityRefresh);
+    }, [fetchFindingSummary, fetchRuns, fetchSpecs, handleTabChange, projectId]);
+
+    // Track visited tabs
+    useEffect(() => {
+        setVisitedTabs(prev => { const next = new Set(prev); next.add(activeTab); return next; });
+    }, [activeTab]);
+
+    // Poll active job
+    useEffect(() => {
+        if (!activeJobId) return;
+        const poll = async () => {
+            try {
+                const res = await fetch(`${API_BASE}${withProjectQuery(`/security-testing/jobs/${activeJobId}`, projectId)}`, { headers: getAuthHeaders() });
+                if (res.ok) {
+                    const data = await res.json();
+                    setJobStatus(data);
+                    if (data.status === 'completed' || data.status === 'failed') {
+                        setIsScanning(false);
+                        if (pollRef.current) clearInterval(pollRef.current);
+                        pollRef.current = null;
+                        fetchRuns();
+                        fetchFindingSummary();
+                    }
+                }
+            } catch (e) { console.error('Poll error:', e); }
+        };
+        poll();
+        pollRef.current = setInterval(poll, 2000);
+        return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    }, [activeJobId, projectId, fetchRuns, fetchFindingSummary]);
+
+    // ========== Actions ==========
+
+    const startScan = useCallback(async () => {
+        if (!canEdit) return;
+        const targetUrl = trimUrlInput(scanUrl);
+        if (!targetUrl) return;
+        setIsScanning(true);
+        setJobStatus(null);
+        try {
+            const body: Record<string, unknown> = withProjectBody({
+                target_url: targetUrl,
+                active_scan_level: activeScanLevel,
+                excluded_paths: excludedPaths.split('\n').map(p => p.trim()).filter(Boolean),
+            }, projectId);
+            if (authEnabled) {
+                body.auth_config = {
+                    enabled: true,
+                    auth_type: 'login',
+                    login_url: loginUrl,
+                    username_key: usernameKey,
+                    password_key: passwordKey,
+                };
+            }
+            const res = await fetch(`${API_BASE}/security-testing/scan/${scanType}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+                body: JSON.stringify(body),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                setActiveJobId(data.job_id);
+            } else {
+                const err = await res.json().catch(() => ({ detail: 'Scan failed' }));
+                setJobStatus({ job_id: '', status: 'failed', message: err.detail });
+                setIsScanning(false);
+            }
+        } catch (e) {
+            setJobStatus({ job_id: '', status: 'failed', message: String(e) });
+            setIsScanning(false);
+        }
+    }, [canEdit, scanUrl, scanType, projectId, activeScanLevel, excludedPaths, authEnabled, loginUrl, usernameKey, passwordKey]);
+
+    const updateFindingStatus = useCallback(async (findingId: number, newStatus: string, notes?: string) => {
+        if (!canEdit) return;
+        try {
+            await fetch(`${API_BASE}${withProjectQuery(`/security-testing/findings/${findingId}/status`, projectId)}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+                body: JSON.stringify(withProjectBody({ status: newStatus, notes }, projectId)),
+            });
+            fetchFindingSummary();
+        } catch (e) { console.error('Update finding status failed:', e); }
+    }, [canEdit, fetchFindingSummary, projectId]);
+
+    const stopScan = useCallback(async (runId: string) => {
+        if (!canEdit) return;
+        try {
+            await fetch(`${API_BASE}${withProjectQuery(`/security-testing/runs/${runId}/stop`, projectId)}`, {
+                method: 'POST',
+                headers: getAuthHeaders(),
+            });
+            fetchRuns();
+        } catch (e) { console.error('Stop security scan failed:', e); }
+    }, [canEdit, fetchRuns, projectId]);
+
+    // ========== Render ==========
+
+    return (
+        <PageLayout tier="wide">
+            <PageHeader
+                title="Security Testing"
+                subtitle="Scan for vulnerabilities, misconfigurations, and security issues."
+                icon={<ShieldAlert size={20} />}
+            />
+
+            {/* Summary Cards */}
+            {findingSummary && (
+                <div className="animate-in stagger-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '1rem', marginBottom: '1.5rem' }}>
+                    {(['critical', 'high', 'medium', 'low', 'info'] as const).map(sev => (
+                        <div key={sev} style={{
+                            ...cardStyle, padding: '1rem', textAlign: 'center',
+                            borderLeft: `3px solid ${severityColor(sev)}`,
+                            boxShadow: 'var(--shadow-card)',
+                            transition: 'all 0.15s var(--ease-smooth)',
+                        }}>
+                            <div style={{ fontSize: '1.5rem', fontWeight: 700, color: severityColor(sev) }}>
+                                {findingSummary[sev]}
+                            </div>
+                            <div style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', textTransform: 'uppercase' }}>
+                                {sev}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* Tabs */}
+            <div className="animate-in stagger-3" style={{ display: 'flex', borderBottom: '1px solid var(--border)', marginBottom: '1.5rem' }}>
+                <button onClick={() => handleTabChange('scanner')} style={createTabStyle(activeTab, 'scanner')}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <Play size={16} /> Scanner
+                    </span>
+                </button>
+                <button onClick={() => handleTabChange('specs')} style={createTabStyle(activeTab, 'specs')}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <FileCode size={16} /> Specs
+                    </span>
+                </button>
+                <button onClick={() => handleTabChange('history')} style={createTabStyle(activeTab, 'history')}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <Clock size={16} /> History
+                    </span>
+                </button>
+                <button onClick={() => handleTabChange('findings')} style={createTabStyle(activeTab, 'findings')}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <Bug size={16} /> Findings
+                        {findingSummary && findingSummary.total > 0 && (
+                            <span style={{
+                                background: 'var(--primary)', color: 'white',
+                                borderRadius: '9999px', padding: '0 6px', fontSize: '0.7rem',
+                            }}>{findingSummary.total}</span>
+                        )}
+                    </span>
+                </button>
+            </div>
+
+            {/* Tab Content */}
+            {activeTab === 'scanner' && (
+                <ScannerTab
+                    scanUrl={scanUrl}
+                    setScanUrl={setScanUrl}
+                    scanType={scanType}
+                    setScanType={setScanType}
+                    isScanning={isScanning}
+                    jobStatus={jobStatus}
+                    capabilities={capabilities}
+                    targets={targets}
+                    credentials={credentials}
+                    activeScanLevel={activeScanLevel}
+                    setActiveScanLevel={setActiveScanLevel}
+                    authEnabled={authEnabled}
+                    setAuthEnabled={setAuthEnabled}
+                    loginUrl={loginUrl}
+                    setLoginUrl={setLoginUrl}
+                    usernameKey={usernameKey}
+                    setUsernameKey={setUsernameKey}
+                    passwordKey={passwordKey}
+                    setPasswordKey={setPasswordKey}
+                    excludedPaths={excludedPaths}
+                    setExcludedPaths={setExcludedPaths}
+                    onRefreshCapabilities={fetchCapabilities}
+                    onStartScan={startScan}
+                    canEdit={canEdit}
+                />
+            )}
+
+            {activeTab === 'specs' && visitedTabs.has('specs') && (
+                <SpecsTab
+                    projectId={projectId}
+                    specs={specs}
+                    fetchSpecs={fetchSpecs}
+                    initialSpecName={searchParams.get('specName') || undefined}
+                    canEdit={canEdit}
+                />
+            )}
+
+            {activeTab === 'history' && visitedTabs.has('history') && (
+                <HistoryTab
+                    runs={runs}
+                    projectId={projectId}
+                    fetchRuns={fetchRuns}
+                    onStatusChange={updateFindingStatus}
+                    onStopScan={stopScan}
+                    initialRunId={searchParams.get('runId') || undefined}
+                    canEdit={canEdit}
+                />
+            )}
+
+            {activeTab === 'findings' && visitedTabs.has('findings') && (
+                <FindingsTab
+                    projectId={projectId}
+                    runs={runs}
+                    onStatusChange={updateFindingStatus}
+                    initialRunId={searchParams.get('runId') || undefined}
+                    initialFindingId={searchParams.get('findingId') || undefined}
+                    canEdit={canEdit}
+                />
+            )}
+        </PageLayout>
+    );
+}

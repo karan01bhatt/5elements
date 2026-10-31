@@ -1,0 +1,499 @@
+1
+00:00:00,000 --> 00:00:02,708
+We are starting on a red checkout failure in Quorvex Demo Shop.
+
+2
+00:00:02,708 --> 00:00:05,501
+The generated Playwright run did not pass, and that is the point.
+
+3
+00:00:05,501 --> 00:00:07,951
+Here we have a commerce project called Quorvex Demo Shop.
+
+4
+00:00:07,951 --> 00:00:11,433
+The dashboard already tells us the release is risky: failed checkout tests, flaky
+
+5
+00:00:11,433 --> 00:00:14,957
+state restoration, a slow checkout retry, and a database quality run with customer
+
+6
+00:00:14,957 --> 00:00:15,688
+and order issues.
+
+7
+00:00:15,688 --> 00:00:17,966
+Most demo videos start with a perfect generated test.
+
+8
+00:00:17,966 --> 00:00:19,556
+Real QA work does not look like that.
+
+9
+00:00:19,556 --> 00:00:23,123
+Real QA work starts when generated tests fail, selectors drift, validation changes,
+
+10
+00:00:23,123 --> 00:00:26,347
+the database disagrees with the UI, and someone has to decide what matters.
+
+11
+00:00:26,347 --> 00:00:29,613
+This walkthrough shows how Quorvex AI turns those failures into organized QA
+
+12
+00:00:29,613 --> 00:00:30,000
+evidence.
+
+13
+00:00:30,000 --> 00:00:35,134
+AI-generated tests and QA agents are useful, but they are not magic.
+
+14
+00:00:35,134 --> 00:00:37,777
+They can produce brittle selectors.
+
+15
+00:00:37,777 --> 00:00:42,081
+They can expose a real bug and still need a human review.
+
+16
+00:00:42,081 --> 00:00:48,196
+They can fail because the application changed, or because the generated assertion
+
+17
+00:00:48,196 --> 00:00:48,951
+was wrong.
+
+18
+00:00:48,951 --> 00:00:54,916
+The useful system is not the one that pretends every generated test is perfect.
+
+19
+00:00:54,916 --> 00:00:59,748
+The useful system is the one that keeps the failure explainable.
+
+20
+00:00:59,748 --> 00:01:06,091
+For a QA team, that means you need specs, historical runs, logs, failure categories,
+
+21
+00:01:06,091 --> 00:01:12,433
+agent findings, generated test ideas, and enough evidence to decide the next action.
+
+22
+00:01:12,433 --> 00:01:15,000
+That is the workflow in this demo.
+
+23
+00:01:15,000 --> 00:01:22,651
+I am starting from the project selector and choosing Quorvex Demo Shop.
+
+24
+00:01:22,651 --> 00:01:29,763
+This project is seeded for the demo, so the data is deterministic.
+
+25
+00:01:29,763 --> 00:01:38,060
+I am not depending on a live agent run behaving perfectly during a recording.
+
+26
+00:01:38,060 --> 00:01:46,789
+The point is to show the workflow clearly: what a QA engineer sees after checkout
+
+27
+00:01:46,789 --> 00:01:53,362
+coverage has been generated and a nightly run found problems.
+
+28
+00:01:53,362 --> 00:02:02,091
+The specs cover login, cart pricing, discount codes, payment validation, checkout
+
+29
+00:02:02,091 --> 00:02:05,323
+state, and order confirmation.
+
+30
+00:02:05,323 --> 00:02:14,267
+The run history includes passed tests, failed tests, a healed checkout run, a flaky
+
+31
+00:02:14,267 --> 00:02:18,578
+checkout-state case, and a slow timeout.
+
+32
+00:02:18,578 --> 00:02:27,414
+That gives us enough signal to talk like a real QA review instead of just clicking
+
+33
+00:02:27,414 --> 00:02:30,000
+through a platform tour.
+
+34
+00:02:30,000 --> 00:02:34,801
+Now I will open the failed run for checkout payment validation.
+
+35
+00:02:34,801 --> 00:02:37,544
+The first failure is selector drift.
+
+36
+00:02:37,544 --> 00:02:43,641
+The test was looking for a Pay now button, but the current page has a hidden old
+
+37
+00:02:43,641 --> 00:02:48,442
+button and a visible submit control with a more stable test id.
+
+38
+00:02:48,442 --> 00:02:51,338
+That is not the same as a product bug.
+
+39
+00:02:51,338 --> 00:02:53,548
+It is automation maintenance.
+
+40
+00:02:53,548 --> 00:02:59,111
+The run details show the stage, the failure reason, and the log evidence.
+
+41
+00:02:59,111 --> 00:03:05,284
+A QA engineer can fix the locator or ask Quorvex to generate a revised Playwright
+
+42
+00:03:05,284 --> 00:03:07,113
+test from the same spec.
+
+43
+00:03:07,113 --> 00:03:11,990
+The next failure is more serious: payment validation regression.
+
+44
+00:03:11,990 --> 00:03:17,401
+The test expected an expired card to be blocked with an inline message.
+
+45
+00:03:17,401 --> 00:03:20,754
+Instead, the page showed payment authorized.
+
+46
+00:03:20,754 --> 00:03:23,268
+That looks like a product defect.
+
+47
+00:03:23,268 --> 00:03:25,021
+The difference matters.
+
+48
+00:03:25,021 --> 00:03:27,612
+Quorvex is not just saying failed.
+
+49
+00:03:27,612 --> 00:03:33,937
+It is separating selector drift from a validation regression, so the team can route
+
+50
+00:03:33,937 --> 00:03:35,385
+the work correctly.
+
+51
+00:03:35,385 --> 00:03:41,406
+I also have a cart total mismatch: expected 86 dollars and 40 cents, but the UI
+
+52
+00:03:41,406 --> 00:03:45,064
+showed 91 dollars and 40 cents after a discount.
+
+53
+00:03:45,064 --> 00:03:49,026
+That points to pricing logic or duplicated shipping.
+
+54
+00:03:49,026 --> 00:03:53,370
+Finally, there is a checkout-state timeout after refresh.
+
+55
+00:03:53,370 --> 00:03:59,314
+That one is marked flaky because historical runs show both passing and failing
+
+56
+00:03:59,314 --> 00:04:00,000
+outcomes.
+
+57
+00:04:00,000 --> 00:04:05,942
+Now I will open the agent run called Checkout Failure Triage.
+
+58
+00:04:05,942 --> 00:04:11,981
+This is a completed report, not a live agent performance demo.
+
+59
+00:04:11,981 --> 00:04:19,675
+It shows what I want from an agent after a failed run: findings, evidence, test
+
+60
+00:04:19,675 --> 00:04:22,500
+ideas, and follow-up actions.
+
+61
+00:04:22,500 --> 00:04:30,390
+The first finding says the payment button locator drifted after a copy and layout
+
+62
+00:04:30,390 --> 00:04:31,071
+change.
+
+63
+00:04:31,071 --> 00:04:38,864
+The evidence points to the failed run log where the locator resolved to a hidden
+
+64
+00:04:38,864 --> 00:04:39,643
+element.
+
+65
+00:04:39,643 --> 00:04:47,143
+The second finding is the important one: expired card validation allows order
+
+66
+00:04:47,143 --> 00:04:48,214
+submission.
+
+67
+00:04:48,214 --> 00:04:56,299
+The evidence says the expected inline error was absent and the run captured Payment
+
+68
+00:04:56,299 --> 00:04:57,857
+authorized text.
+
+69
+00:04:57,857 --> 00:05:03,604
+The third finding connects the UI mismatch to cart pricing.
+
+70
+00:05:03,604 --> 00:05:08,766
+The frontend total diverges from the pricing preview.
+
+71
+00:05:08,766 --> 00:05:12,760
+From here, the test ideas are actionable.
+
+72
+00:05:12,760 --> 00:05:20,065
+One suggestion is to add an API-backed cart total contract before checkout.
+
+73
+00:05:20,065 --> 00:05:27,857
+Another is to retry checkout after an expired session and make sure the customer
+
+74
+00:05:27,857 --> 00:05:31,558
+returns to the original checkout path.
+
+75
+00:05:31,558 --> 00:05:35,162
+This is the value of the agent layer.
+
+76
+00:05:35,162 --> 00:05:38,377
+It does not replace QA ownership.
+
+77
+00:05:38,377 --> 00:05:45,000
+It collects context and proposes work that a QA engineer can review.
+
+78
+00:05:45,000 --> 00:05:47,312
+Next I will open the specs.
+
+79
+00:05:47,312 --> 00:05:52,962
+The checkout payment validation spec is written in plain markdown.
+
+80
+00:05:52,962 --> 00:05:59,726
+It says what the user does, what data is used, and what the expected result is.
+
+81
+00:05:59,726 --> 00:06:06,832
+This is important because the generated Playwright code should be traceable back to
+
+82
+00:06:06,832 --> 00:06:11,284
+the requirement, not just appear as a random script.
+
+83
+00:06:11,284 --> 00:06:18,305
+The cart total spec describes the exact pricing expectation: line items, discount,
+
+84
+00:06:18,305 --> 00:06:20,445
+tax, shipping, and total.
+
+85
+00:06:20,445 --> 00:06:23,784
+That makes the failed assertion useful.
+
+86
+00:06:23,784 --> 00:06:30,719
+We can tell whether the test is wrong, the UI is wrong, or the backend preview is
+
+87
+00:06:30,719 --> 00:06:31,233
+wrong.
+
+88
+00:06:31,233 --> 00:06:38,253
+The login recovery and checkout state specs cover edge cases that are easy to miss
+
+89
+00:06:38,253 --> 00:06:40,051
+in a happy-path demo.
+
+90
+00:06:40,051 --> 00:06:46,729
+Session expiry and page refresh are exactly where checkout flows become flaky.
+
+91
+00:06:46,729 --> 00:06:50,839
+The generated tests are not the source of truth.
+
+92
+00:06:50,839 --> 00:06:53,836
+The specs are the source of intent.
+
+93
+00:06:53,836 --> 00:07:00,000
+The tests are executable coverage that should evolve as the app changes.
+
+94
+00:07:00,000 --> 00:07:03,805
+Now I will switch to database testing.
+
+95
+00:07:03,805 --> 00:07:07,911
+This is not a full database-testing tour.
+
+96
+00:07:07,911 --> 00:07:14,319
+I just want to show why UI failures often need backend evidence.
+
+97
+00:07:14,319 --> 00:07:19,626
+The demo database run has passing and failing checks.
+
+98
+00:07:19,626 --> 00:07:27,136
+It catches duplicate customers, invalid email format, a negative order item
+
+99
+00:07:27,136 --> 00:07:33,745
+quantity, and a payment total that does not match the order total.
+
+100
+00:07:33,745 --> 00:07:38,752
+Those issues connect directly to checkout quality.
+
+101
+00:07:38,752 --> 00:07:46,762
+If a payment run fails in the browser, and the database also shows order/payment
+
+102
+00:07:46,762 --> 00:07:50,968
+mismatches, the QA story becomes stronger.
+
+103
+00:07:50,968 --> 00:07:59,079
+The dashboard then gives the broader signal: pass/fail trend, failure categories,
+
+104
+00:07:59,079 --> 00:08:02,183
+flaky tests, and slowest tests.
+
+105
+00:08:02,183 --> 00:08:10,093
+A QA lead can decide whether the release risk is mostly automation maintenance,
+
+106
+00:08:10,093 --> 00:08:15,000
+product regression, data quality, or performance.
+
+107
+00:08:15,000 --> 00:08:18,018
+Here is the workflow again.
+
+108
+00:08:18,018 --> 00:08:22,265
+We started with failed checkout tests.
+
+109
+00:08:22,265 --> 00:08:30,425
+We inspected a specific failure and separated selector drift from product
+
+110
+00:08:30,425 --> 00:08:31,654
+regression.
+
+111
+00:08:31,654 --> 00:08:40,373
+We reviewed an agent report with findings, evidence, test ideas, and follow-up
+
+112
+00:08:40,373 --> 00:08:41,267
+actions.
+
+113
+00:08:41,267 --> 00:08:46,632
+We connected specs to generated Playwright work.
+
+114
+00:08:46,632 --> 00:08:55,127
+Then we looked at database and dashboard signals to understand release risk.
+
+115
+00:08:55,127 --> 00:09:03,957
+That is the shape of Quorvex AI: generate and organize Playwright QA work, keep
+
+116
+00:09:03,957 --> 00:09:09,322
+evidence attached, and make failures reviewable.
+
+117
+00:09:09,322 --> 00:09:12,116
+Teams still own the code.
+
+118
+00:09:12,116 --> 00:09:16,140
+Teams still decide what should ship.
+
+119
+00:09:16,140 --> 00:09:24,747
+Quorvex helps collect the context faster and keeps the work from turning into
+
+120
+00:09:24,747 --> 00:09:30,000
+scattered logs, screenshots, and chat messages.
+
+121
+00:09:30,000 --> 00:09:38,344
+If you want to try this exact demo, seed the project with make youtube-demo-seed and
+
+122
+00:09:38,344 --> 00:09:40,629
+open Quorvex Demo Shop.
+
+123
+00:09:40,629 --> 00:09:48,874
+Star the repo if this workflow is useful, and comment with the QA workflow you want
+
+124
+00:09:48,874 --> 00:09:56,225
+next: API contract testing, PR test selection, database quality checks, or
+
+125
+00:09:56,225 --> 00:10:00,000
+agent-assisted Playwright maintenance.

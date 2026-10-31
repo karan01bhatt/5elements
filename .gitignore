@@ -1,0 +1,144 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+!deploy/private-repo-template/env/
+!deploy/private-repo-template/env/quorvex.prod.env.example
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Claude Code
+.claude/settings.local.json
+
+# Test outputs
+/runs/
+/test-results/
+
+# Generated specs, requirements, recordings, and tests
+/specs/*
+!/specs/spec-metadata.json
+!/specs/examples/
+!/specs/examples/**
+!/specs/benchmark/
+!/specs/benchmark/**
+!/specs/templates/
+!/specs/templates/**
+/tests/apps/
+/tests/generated/
+/tests/recordings/
+
+*.png
+!docs/assets/**/*.png
+
+# Environment
+.env
+.env.local
+.env.prod
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+*.log
+
+# Project Specific
+marketing/
+.playwright-mcp/
+
+# Marketing and video production (local only)
+specs/demo-marketing/
+docs/assets/social-preview.png
+docs/assets/social-preview.svg
+scripts/demo-video/output/
+scripts/demo-video/campaign-config.json
+scripts/docs-assets/output/
+content/youtube/episodes/*/build/
+content/youtube/episodes/*/renders/
+content/youtube/episodes/*/*.mp4
+content/youtube/episodes/*/*.mov
+content/youtube/episodes/*/*.webm
+content/youtube/episodes/*/*.mp3
+content/youtube/episodes/*/*.wav
+
+# Playwright MCP temp files
+healer_result.json
+healer-result.json
+.claude/settings.json
+.claude/settings.local.json
+.claude/memory/
+
+
+# Node
+node_modules/
+
+# Data
+data/
+
+# PDF
+pdf/
+
+# Generated Data and DB
+prds/
+!deploy/private-repo-template/prds/
+!deploy/private-repo-template/prds/**
+test.db
+test.db-shm
+test.db-wal
+web/.next/
+web/out/
+
+# MkDocs build output
+site/
+
+# Sensitive files
+.env.prod
+*.pem
+*.key
+*.crt
+nginx/certs/
+backups/
+*.sql
+*.dump
+
+# Secrets and credentials
+.secrets/
+credentials.json
+service-account*.json
+*.p12
+*.pfx
+
+# ChromaDB data
+data/chromadb/
+
+# MinIO data
+minio_data/
+
+# Docker volumes
+postgres_data/
+
+# Logs
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+
+# Pre-commit
+.pre-commit-config.yaml.bak
+.secrets.baseline

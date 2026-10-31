@@ -1,0 +1,53 @@
+name: Optional Playwright AI Smoke
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Optional Playwright smoke with AI credentials
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Detect API token
+      id: detect-token
+      env:
+        ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+      run: |
+        if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+          echo "has_token=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_token=false" >> "$GITHUB_OUTPUT"
+          echo "ANTHROPIC_AUTH_TOKEN is not configured; skipping Playwright tests."
+        fi
+
+    - uses: actions/setup-node@v4
+      if: steps.detect-token.outputs.has_token == 'true'
+      with:
+        node-version: 20
+    - name: Install dependencies
+      if: steps.detect-token.outputs.has_token == 'true'
+      run: npm ci
+    - name: Install Playwright Browsers
+      if: steps.detect-token.outputs.has_token == 'true'
+      run: npx playwright install --with-deps
+    - name: Run Playwright tests
+      if: steps.detect-token.outputs.has_token == 'true'
+      continue-on-error: true
+      env:
+        ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+      run: npx playwright test
+    - uses: actions/upload-artifact@v4
+      if: always() && steps.detect-token.outputs.has_token == 'true'
+      with:
+        name: playwright-report
+        path: playwright-report/
+        retention-days: 30

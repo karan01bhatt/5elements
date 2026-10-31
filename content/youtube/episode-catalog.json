@@ -1,0 +1,13 @@
+{
+  "episodes": [
+    {
+      "id": "001",
+      "title": "AI-Generated Playwright Tests Failed — Now What?",
+      "project": "Quorvex Demo Shop",
+      "audience": "QA engineers and QA automation leads",
+      "duration_minutes": "8-10",
+      "seed_command": "make youtube-demo-seed",
+      "status": "ready-to-record"
+    }
+  ]
+}

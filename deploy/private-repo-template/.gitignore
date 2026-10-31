@@ -1,0 +1,25 @@
+# Server-local secrets.
+env/*
+!env/
+!env/*.example
+
+# Deployment state and runtime data.
+.state/
+data/
+backups/
+logs/
+generated-scripts/
+postgres/
+redis/
+minio/
+runs/
+test-results/
+
+# Company specs, tests, fixtures, and PRDs are intentionally tracked in this
+# private repo. Runtime results stay ignored above.
+
+# Local editor, OS, and temporary files.
+.DS_Store
+*.tmp
+*.bak
+*.swp
