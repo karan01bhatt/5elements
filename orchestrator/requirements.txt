@@ -27,7 +27,7 @@ python-jose[cryptography]>=3.3.0
 python-owasp-zap-v2.4>=0.1.0
 pydantic[email]>=2.0.0
 pydantic-settings>=2.0.0
-slowapi>=0.1.8
+slowapi>=0.1.10
 redis>=4.0.0
 
 # PDF Processing (PRD feature)
