@@ -32,7 +32,7 @@ redis>=4.0.0
 
 # PDF Processing (PRD feature)
 # pdfplumber for reliable PDF text extraction (no GPU required)
-pdfplumber>=0.10.0
+pdfplumber>=0.11.10
 # PyMuPDF for fast PDF processing with images
 pymupdf>=1.23.0
 
